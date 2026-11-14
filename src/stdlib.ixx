@@ -1130,9 +1130,13 @@ function void http_url_free(HttpUrl parsed) {
     free(parsed)
 }
 
+// Response constructors take ownership of the header/body buffers they are
+// given (http_request_send pas)SBHTTP"
+            R"SBHTTP(ses freshly allocated ones). body_text and
+// raw_headers must be heap-owned (or 0); pass a literal and the later
+// http_response_free would hand a PE image pointer to HeapFree.
 function HttpResponse http_response_new(int status, str body_text) {
-    let response = malloc(40) as HttpR)SBHTTP"
-            R"SBHTTP(esponse
+    let response = malloc(40) as HttpResponse
     if response == 0 {
         if body_text != 0 {
             free(body_text)
@@ -1450,7 +1454,8 @@ function int http_query_status(ptr request_handle, ptr query_headers) {
     var status = 0
     let query_fn = query_headers as WinHttpQueryHeadersFn
     // WINHTTP_QUERY_STATUS_CODE (19) | WINHTTP_QUERY_FLAG_NUMBER (0x20000000)
-    let ok = query_fn(request_handle, 19 + 536870912, 0, status_ptr, size_ptr, 0)
+    let ok = query_fn(request_handle, 19 + 536870912,)SBHTTP"
+            R"SBHTTP( 0, status_ptr, size_ptr, 0)
     if ok != 0 {
         status = mem.read32(status_ptr)
     }
@@ -1461,8 +1466,7 @@ function int http_query_status(ptr request_handle, ptr query_headers) {
 }
 
 // Read the full response body into a freshly allocated buffer.
-// Returns the buffer pointer (caller frees) and writes the byte cou)SBHTTP"
-            R"SBHTTP(nt to
+// Returns the buffer pointer (caller frees) and writes the byte count to
 // len_out. Keeps embedded NULs, so it is safe for binary payloads.
 function ptr http_read_body_bytes(ptr request_handle, ptr query_data_available, ptr read_data, ptr len_out) {
     let available_ptr = mem.make_zero(8)
@@ -1708,7 +1712,8 @@ enum HttpRequestOffset {
     Body = 40,            // ptr raw bytes
     BodyLen = 48,         // int
     ContentType = 56,     // str
-    UserAgent = 64,       // str
+    UserAgent = 64,      )SBHTTP"
+            R"SBHTTP( // str
     TimeoutMs = 72,       // int
     FollowRedirects = 80, // int (bool)
 }
@@ -1719,8 +1724,7 @@ view HttpRequest {
     method: str @ HttpRequestOffset.Method
     url: str @ HttpRequestOffset.Url
     header_buf: ptr @ HttpRequestOffset.HeaderBuf
-    heade)SBHTTP"
-            R"SBHTTP(r_len: int @ HttpRequestOffset.HeaderLen
+    header_len: int @ HttpRequestOffset.HeaderLen
     header_cap: int @ HttpRequestOffset.HeaderCap
     body: ptr @ HttpRequestOffset.Body
     body_len: int @ HttpRequestOffset.BodyLen
@@ -2000,7 +2004,8 @@ function HttpResponse http_request_send(HttpRequest req) {
     let path_w = http_url_path_utf16(parsed)
     if host_w == 0 or method_w == 0 or path_w == 0 {
         if host_w != 0 { free(host_w) }
-        if method_w != 0 { free(method_w) }
+        if method_w != 0 {)SBHTTP"
+            R"SBHTTP( free(method_w) }
         if path_w != 0 { free(path_w) }
         http_url_free(parsed)
         return http_fail_response()
@@ -2011,8 +2016,7 @@ function HttpResponse http_request_send(HttpRequest req) {
         free(host_w)
         free(method_w)
         free(path_w)
-      )SBHTTP"
-            R"SBHTTP(  http_url_free(parsed)
+        http_url_free(parsed)
         return http_fail_response()
     }
 
@@ -2246,7 +2250,8 @@ function HttpResponse http_post(str url, str content_type, str body_text) {
         return http_fail_response()
     }
     http_request_body_text(req, body_text, content_type)
-    let response = http_request_send(req)
+    let respons)SBHTTP"
+            R"SBHTTP(e = http_request_send(req)
     http_request_free(req)
     return response
 }
@@ -2256,8 +2261,7 @@ function HttpResponse http_put(str url, str content_type, str body_text) {
     if req == 0 {
         return http_fail_response()
     }
-    http_request_body_text(req,)SBHTTP"
-            R"SBHTTP( body_text, content_type)
+    http_request_body_text(req, body_text, content_type)
     let response = http_request_send(req)
     http_request_free(req)
     return response

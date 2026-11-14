@@ -314,6 +314,10 @@ function void http_url_free(HttpUrl parsed) {
     free(parsed)
 }
 
+// Response constructors take ownership of the header/body buffers they are
+// given (http_request_send passes freshly allocated ones). body_text and
+// raw_headers must be heap-owned (or 0); pass a literal and the later
+// http_response_free would hand a PE image pointer to HeapFree.
 function HttpResponse http_response_new(int status, str body_text) {
     let response = malloc(40) as HttpResponse
     if response == 0 {

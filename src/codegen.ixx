@@ -7200,6 +7200,110 @@ private:
         return std::find(kReleaseBuiltins.begin(), kReleaseBuiltins.end(), name) != kReleaseBuiltins.end();
     }
 
+    // Does `stmt` (recursively) call a release builtin on the named identifier?
+    // Used to decide whether a callee takes ownership of a parameter, so a call
+    // site passing a string literal can be flagged before it reaches HeapFree.
+    [[nodiscard]] static bool stmt_releases_named_value(const ast::Stmt& stmt, std::string_view name) {
+        struct Walker {
+            std::string_view name;
+            [[nodiscard]] bool expr_calls_release(const ast::Expr& expr) const {
+                if (auto* call = std::get_if<ast::CallExpr>(&expr.kind)) {
+                    if (call->callee->is<ast::IdentExpr>()) {
+                        const auto& callee_name = call->callee->as<ast::IdentExpr>().name;
+                        if (is_obvious_owner_release_builtin(callee_name) && !call->args.empty() &&
+                            call->args[0]->is<ast::IdentExpr>() &&
+                            call->args[0]->as<ast::IdentExpr>().name == name) {
+                            return true;
+                        }
+                    }
+                    for (const auto& arg : call->args) {
+                        if (expr_calls_release(*arg)) return true;
+                    }
+                }
+                if (auto* bin = std::get_if<ast::BinaryExpr>(&expr.kind)) {
+                    return expr_calls_release(*bin->lhs) || expr_calls_release(*bin->rhs);
+                }
+                if (auto* un = std::get_if<ast::UnaryExpr>(&expr.kind)) {
+                    return expr_calls_release(*un->operand);
+                }
+                if (auto* cast = std::get_if<ast::CastExpr>(&expr.kind)) {
+                    return expr_calls_release(*cast->expr);
+                }
+                return false;
+            }
+            [[nodiscard]] bool suite_releases(const ast::StmtSuite& suite) const {
+                for (const auto& s : suite.stmts) {
+                    if (stmt_releases_named_value(*s, name)) return true;
+                }
+                return false;
+            }
+        } walker{name};
+
+        return std::visit(overloaded{
+            [&](const ast::ExprStmt& s) -> bool { return s.expr && walker.expr_calls_release(*s.expr); },
+            [&](const ast::LetStmt& s) -> bool { return s.init && walker.expr_calls_release(*s.init); },
+            [&](const ast::ReturnStmt& s) -> bool { return s.value && walker.expr_calls_release(*s.value); },
+            [&](const ast::DeferStmt& s) -> bool {
+                return s.stmt && stmt_releases_named_value(*s.stmt, name);
+            },
+            [&](const ast::IfStmt& s) -> bool {
+                if (s.condition && walker.expr_calls_release(*s.condition)) return true;
+                if (walker.suite_releases(s.then_block)) return true;
+                if (s.has_else() && walker.suite_releases(*s.else_block)) return true;
+                return false;
+            },
+            [&](const ast::WhileStmt& s) -> bool {
+                if (s.condition && walker.expr_calls_release(*s.condition)) return true;
+                return walker.suite_releases(s.body);
+            },
+            [&](const ast::ForStmt& s) -> bool { return walker.suite_releases(s.body); },
+            [&](const ast::LoopStmt& s) -> bool { return walker.suite_releases(s.body); },
+            [&](const ast::BlockStmt& s) -> bool { return walker.suite_releases(s.block.stmts); },
+            [&](const ast::SwitchStmt&) -> bool { return false; },
+            [&](const auto&) -> bool { return false; },
+        }, stmt.kind);
+    }
+
+    // Which parameters of a user-defined callee get handed to free()/array_free()?
+    [[nodiscard]] std::vector<std::string> callee_owned_params(std::string_view callee_name) {
+        std::vector<std::string> owned;
+        auto it = functions_.find(std::string(callee_name));
+        if (it == functions_.end() || !it->second.decl) {
+            return owned;
+        }
+        const ast::FnDecl& decl = *it->second.decl;
+        if (!decl.has_body()) {
+            return owned;
+        }
+        for (const auto& param : decl.params) {
+            if (param.type.is_primitive()) {
+                // only string/pointer params can be heap-owned
+                auto* p = std::get_if<PrimitiveType>(&param.type.kind);
+                if (!p || (*p != PrimitiveType::Str && *p != PrimitiveType::Ptr &&
+                           *p != PrimitiveType::U8 && *p != PrimitiveType::I8)) {
+                    continue;
+                }
+            }
+            for (const auto& stmt : decl.body_ref().stmts) {
+                if (stmt_releases_named_value(*stmt, param.name)) {
+                    owned.push_back(param.name);
+                    break;
+                }
+            }
+        }
+        return owned;
+    }
+
+    [[nodiscard]] static bool expr_is_string_literal(const ast::Expr& expr) {
+        if (auto* cast = std::get_if<ast::CastExpr>(&expr.kind)) {
+            return expr_is_string_literal(*cast->expr);
+        }
+        if (auto* lit = std::get_if<ast::LiteralExpr>(&expr.kind)) {
+            return std::holds_alternative<std::string>(lit->value);
+        }
+        return false;
+    }
+
     [[nodiscard]] bool expr_obviously_produces_owned_value(const ast::Expr& expr) {
         if (auto* cast = std::get_if<ast::CastExpr>(&expr.kind)) {
             return expr_obviously_produces_owned_value(*cast->expr);
@@ -13320,6 +13424,30 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         if (it == functions_.end()) {
             error_undefined_name("function", resolved_target, collect_function_name_candidates());
             return false;
+        }
+
+        // warn when a string literal is passed to a parameter the callee frees:
+        // the literal lives in the PE image, not the heap, so the eventual
+        // HeapFree corrupts the heap (Windows STATUS_HEAP_CORRUPTION).
+        if (it->second.decl && it->second.decl->has_body()) {
+            auto owned = callee_owned_params(resolved_target);
+            for (std::size_t i = 0; i < call.args.size() && i < it->second.param_types.size(); ++i) {
+                if (!expr_is_string_literal(*call.args[i])) {
+                    continue;
+                }
+                const auto& ptype = it->second.param_types[i];
+                auto* prim = std::get_if<PrimitiveType>(&ptype.kind);
+                if (!prim || (*prim != PrimitiveType::Str && *prim != PrimitiveType::Ptr)) {
+                    continue;
+                }
+                if (std::find(owned.begin(), owned.end(), it->second.decl->params[i].name) != owned.end()) {
+                    warn(std::format(
+                        "passing a string literal to '{}' parameter '{}', which the function frees; "
+                        "the literal is not heap-allocated and freeing it corrupts the heap "
+                        "(clone it with string_substring first)",
+                        resolved_target, it->second.decl->params[i].name));
+                }
+            }
         }
 
         if (should_inline_direct_call(call, it->second)) {
