@@ -20,7 +20,7 @@ import fmt
 | `fmt` | single-pass formatting (`fmt_bool`, `fmt_int`, `fmt_pair`, `fmt_csv3`, `fmt_hex_byte`) |
 | `fs` | file read/write helpers |
 | `json` | zero-copy `view`-backed JSON DOM parser, `json_stringify`, and fast lookups |
-| `http` | WinHTTP `http_fetch`, `http_get`, `http_ok`, and `http_parse_url` |
+| `http` | WinHTTP client: request builder, headers, bodies, query strings, url codec, `http_fetch`/`http_get`, `http_ok`, `http_parse_url` |
 | `path` | path joining, stem, extension, basename/dirname helpers |
 | `process` | process ID, handle, dynamic DLL loading, message box, exit |
 | `rand` | SplitMix64 + Xorshift64* PRNG (`rand_seed`, `rand_next`, `rand_range`) |
@@ -138,7 +138,9 @@ function int main() {
 
 ## `http`
 
-`http` wraps WinHTTP with typed function pointers and `view` overlays (`HttpUrl`, `HttpResponse`):
+`http` wraps WinHTTP with typed function pointers and `view` overlays (`HttpUrl`, `HttpResponse`, `HttpRequest`). It covers simple GETs up to full request building with headers, bodies and query strings.
+
+Simplest form:
 
 ```c
 import http
@@ -152,6 +154,41 @@ function int main() {
     return 0
 }
 ```
+
+Full request building:
+
+```c
+import http
+
+function int main() {
+    let req = http_request_new("POST", "https://api.example.com/v1/items")
+    http_request_header(req, "Accept", "application/json")
+    http_request_body_text(req, "{\"name\":\"x\"}", "application/json")
+    http_request_timeout(req, 5000)
+    http_request_follow_redirects(req, true)
+
+    let resp = http_request_send(req)
+    http_request_free(req)
+
+    if resp != 0 {
+        print_int(resp.status)          // 200
+        println(resp.body)              // response body
+        let ct = http_response_content_type(resp)
+        println(ct)                     // e.g. application/json
+        free(ct)
+        http_response_free(resp)
+    }
+    return 0
+}
+```
+
+Verb helpers: `http_get`, `http_post`, `http_put`, `http_patch`, `http_delete`, `http_head`, plus generic `http_request(method, url)`.
+
+Request builder: `http_request_new(method, url)`, `http_request_header(name, value)` (call repeatedly; the buffer grows), `http_request_body(bytes, len, content_type)`, `http_request_body_text(text, content_type)`, `http_request_user_agent(ua)`, `http_request_timeout(ms)`, `http_request_follow_redirects(bool)`, `http_request_free(req)`.
+
+Response: `http_response_header(resp, name)` (case-insensitive, trimmed; returns a heap string or `0`), `http_response_content_type(resp)`, `http_ok(resp)`, `http_response_free(resp)`. For binary payloads use `resp.body_bytes` (raw buffer, keeps embedded NULs) with `resp.body_len`, since `resp.body` is a null-terminated str view that stops at the first NUL.
+
+Helpers: `http_url_encode(s)` / `http_url_decode(s)` (RFC3986, `+` decodes to space), `http_build_query(keys, values, count)` builds `k=v&k2=v2` with percent-encoded values, `http_parse_url(url)` returns an `HttpUrl` view. Extras: `http_url_with_query(url, k, v)` / `http_request_add_query(req, k, v)` append encoded query args, `http_base64_encode(bytes, len)` + `http_basic_auth(user, pass)` / `http_request_basic_auth(req, user, pass)` build an `Authorization: Basic` header, and `http_multipart_field(name, value, boundary, _)` / `http_multipart_content_type(boundary)` build `multipart/form-data` bodies.
 
 ## `vec` and `algo`
 

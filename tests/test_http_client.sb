@@ -1,0 +1,228 @@
+import http
+import text
+import mem
+
+// Offline coverage for the http client: url encoding, request builder,
+// query building, and response header lookup. No network required.
+
+fn test_url_codec() -> int {
+    let e = http_url_encode("a b&c=d/e")
+    if !text_eq(e, "a%20b%26c%3Dd%2Fe") { free(e); return 1 }
+    free(e)
+
+    let e2 = http_url_encode("safe-_.~AZaz09")
+    if !text_eq(e2, "safe-_.~AZaz09") { free(e2); return 2 }
+    free(e2)
+
+    let d = http_url_decode("a%20b%26c%3Dd%2Fe")
+    if !text_eq(d, "a b&c=d/e") { free(d); return 3 }
+    free(d)
+
+    let dp = http_url_decode("x+y")
+    if !text_eq(dp, "x y") { free(dp); return 4 }
+    free(dp)
+
+    let empty = http_url_encode("")
+    if !text_eq(empty, "") { free(empty); return 5 }
+    free(empty)
+    return 0
+}
+
+fn test_request_builder() -> int {
+    let req = http_request_new("POST", "https://api.example.com/v1/items")
+    if req == 0 { return 1 }
+    if !text_eq(req.method, "POST") { http_request_free(req); return 2 }
+    if !text_eq(req.url, "https://api.example.com/v1/items") { http_request_free(req); return 3 }
+    if req.timeout_ms <= 0 { http_request_free(req); return 4 }
+
+    http_request_header(req, "X-One", "first")
+    http_request_header(req, "Accept", "application/json")
+    let block = req.header_buf as str
+    if !text_contains(block, "X-One: first\r\n") { http_request_free(req); return 5 }
+    if !text_contains(block, "Accept: application/json\r\n") { http_request_free(req); return 6 }
+
+    http_request_body_text(req, "{\"k\":1}", "application/json")
+    if req.body_len != 7 { http_request_free(req); return 7 }
+    if !text_eq(req.content_type, "application/json") { http_request_free(req); return 8 }
+
+    http_request_user_agent(req, "SableTest/2.0")
+    if !text_eq(req.user_agent, "SableTest/2.0") { http_request_free(req); return 9 }
+
+    http_request_timeout(req, 2000)
+    if req.timeout_ms != 2000 { http_request_free(req); return 10 }
+
+    http_request_follow_redirects(req, false)
+    if req.follow_redirects != 0 { http_request_free(req); return 11 }
+    http_request_follow_redirects(req, true)
+    if req.follow_redirects != 1 { http_request_free(req); return 12 }
+
+    // many headers force the growable buffer to reallocate
+    var i = 0
+    while i < 40 {
+        http_request_header(req, "X-Bulk", "repeated-value")
+        i++
+    }
+    let big = req.header_buf as str
+    if !text_contains(big, "X-One: first\r\n") { http_request_free(req); return 13 }
+    if !text_contains(big, "X-Bulk: repeated-value\r\n") { http_request_free(req); return 14 }
+
+    http_request_free(req)
+    return 0
+}
+
+fn test_query_builder() -> int {
+    let keys = malloc(32) as *int
+    let vals = malloc(32) as *int
+    if keys == 0 or vals == 0 {
+        if keys != 0 { free(keys) }
+        if vals != 0 { free(vals) }
+        return 1
+    }
+    keys[0] = "name" as int
+    keys[1] = "q" as int
+    keys[2] = "empty" as int
+    vals[0] = "sa ble" as int
+    vals[1] = "a&b=c" as int
+    vals[2] = "" as int
+
+    let qs = http_build_query(keys as ptr, vals as ptr, 3)
+    if !text_eq(qs, "name=sa%20ble&q=a%26b%3Dc&empty=") {
+        free(qs); free(keys); free(vals); return 2
+    }
+    free(qs)
+
+    keys[0] = "solo" as int
+    vals[0] = "v" as int
+    let single = http_build_query(keys as ptr, vals as ptr, 1)
+    if !text_eq(single, "solo=v") { free(single); free(keys); free(vals); return 3 }
+    free(single)
+
+    let none = http_build_query(keys as ptr, vals as ptr, 0)
+    if !text_eq(none, "") { free(none); free(keys); free(vals); return 4 }
+    free(none)
+
+    free(keys)
+    free(vals)
+    return 0
+}
+
+fn test_url_extras() -> int {
+    // base64
+    let b1 = http_base64_encode("Man" as ptr, 3)
+    if !text_eq(b1, "TWFu") { free(b1); return 1 }
+    free(b1)
+    let b2 = http_base64_encode("Ma" as ptr, 2)
+    if !text_eq(b2, "TWE=") { free(b2); return 2 }
+    free(b2)
+    let b3 = http_base64_encode("M" as ptr, 1)
+    if !text_eq(b3, "TQ==") { free(b3); return 3 }
+    free(b3)
+    let b4 = http_base64_encode("hello world" as ptr, 11)
+    if !text_eq(b4, "aGVsbG8gd29ybGQ=") { free(b4); return 4 }
+    free(b4)
+
+    // basic auth
+    let auth = http_basic_auth("user", "pass")
+    if !text_eq(auth, "Basic dXNlcjpwYXNz") { free(auth); return 5 }
+    free(auth)
+
+    // query append
+    let u1 = http_url_with_query("http://x/api", "a", "b c")
+    if !text_eq(u1, "http://x/api?a=b%20c") { free(u1); return 6 }
+    free(u1)
+    let u2 = http_url_with_query("http://x/api?z=1", "a", "b")
+    if !text_eq(u2, "http://x/api?z=1&a=b") { free(u2); return 7 }
+    free(u2)
+
+    // request_add_query mutates req.url
+    let req = http_request_new("GET", "http://x/search")
+    let qret = http_request_add_query(req, "q", "hello world")
+    if qret == 0 { http_request_free(req); return 8 }
+    if !text_eq(req.url, "http://x/search?q=hello%20world") { http_request_free(req); return 9 }
+    http_request_free(req)
+
+    // multipart body + content type
+    let body = http_multipart_field("field", "value", "BOUND")
+    if !text_contains(body, "name=\"field\"") { free(body); return 10 }
+    if !text_contains(body, "value") { free(body); return 11 }
+    if !text_contains(body, "--BOUND--") { free(body); return 12 }
+    free(body)
+    let ct = http_multipart_content_type("BOUND")
+    if !text_eq(ct, "multipart/form-data; boundary=BOUND") { free(ct); return 13 }
+    free(ct)
+    return 0
+}
+
+fn test_binary_body() -> int {
+    // body with embedded NULs must survive via body_bytes/body_len
+    let buf = malloc(8)
+    if buf == 0 { return 1 }
+    mem.write8(buf + 0, 65)   // 'A'
+    mem.write8(buf + 1, 0)    // NUL
+    mem.write8(buf + 2, 66)   // 'B'
+    mem.write8(buf + 3, 0)    // NUL
+    mem.write8(buf + 4, 67)   // 'C'
+    let resp = http_response_new_binary(200, buf, 5, 0 as str)
+    if resp == 0 { free(buf); return 2 }
+    if resp.body_len != 5 { http_response_free(resp); return 3 }
+    if resp.body_bytes == 0 { http_response_free(resp); return 4 }
+    if mem.read8(resp.body_bytes + 0) != 65 { http_response_free(resp); return 5 }
+    if mem.read8(resp.body_bytes + 2) != 66 { http_response_free(resp); return 6 }
+    if mem.read8(resp.body_bytes + 4) != 67 { http_response_free(resp); return 7 }
+    // str view truncates at the first NUL, which is expected for the text helper
+    if string_length(resp.body) != 1 { http_response_free(resp); return 8 }
+    http_response_free(resp)
+    return 0
+}
+
+fn test_response_headers() -> int {
+    let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nServer: nginx\r\nX-Padded:   spaced out   \r\nX-Empty:\r\n\r\n"
+    let resp = http_response_new_full(200, "hello", raw)
+    if resp == 0 { return 1 }
+    if resp.status != 200 { http_response_free(resp); return 2 }
+    let ct = http_response_content_type(resp)
+    if !text_eq(ct, "text/html; charset=utf-8") { free(ct); http_response_free(resp); return 3 }
+    free(ct)
+
+    let srv = http_response_header(resp, "server")
+    if !text_eq(srv, "nginx") { free(srv); http_response_free(resp); return 4 }
+    free(srv)
+
+    let srv_upper = http_response_header(resp, "SERVER")
+    if !text_eq(srv_upper, "nginx") { free(srv_upper); http_response_free(resp); return 5 }
+    free(srv_upper)
+
+    let padded = http_response_header(resp, "x-padded")
+    if !text_eq(padded, "spaced out") { free(padded); http_response_free(resp); return 6 }
+    free(padded)
+
+    let empty = http_response_header(resp, "X-Empty")
+    if !text_eq(empty, "") { free(empty); http_response_free(resp); return 7 }
+    free(empty)
+
+    if http_response_header(resp, "Missing") != 0 { http_response_free(resp); return 8 }
+
+    if !http_ok(resp) { http_response_free(resp); return 9 }
+    http_response_free(resp)
+
+    let not_found = http_response_new_full(404, "nope", 0 as str)
+    if http_ok(not_found) { http_response_free(not_found); return 10 }
+    http_response_free(not_found)
+    return 0
+}
+
+fn main() -> int {
+    let r1 = test_url_codec()
+    if r1 != 0 { return 10 + r1 }
+    let r2 = test_request_builder()
+    if r2 != 0 { return 20 + r2 }
+    let r3 = test_query_builder()
+    if r3 != 0 { return 30 + r3 }
+    let r4 = test_response_headers()
+    if r4 != 0 { return 40 + r4 }
+    let r5 = test_url_extras()
+    if r5 != 0 { return 50 + r5 }
+    let r6 = test_binary_body()
+    if r6 != 0 { return 60 + r6 }
+    return 0
+}

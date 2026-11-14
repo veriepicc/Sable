@@ -1780,6 +1780,13 @@
   },
   {
     "kind": "stress",
+    "Name": "test_http_client",
+    "File": "tests/test_http_client.sb",
+    "ExpectedExit": 0,
+    "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
     "Name": "test_compiler_codegen_regressions",
     "File": "tests/test_compiler_codegen_regressions.sb",
     "ExpectedExit": 0,

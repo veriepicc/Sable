@@ -73,12 +73,26 @@ function int main() {
     free(esc_text)
 
     let compact = json_stringify(root)
-    if string_equals(compact, source) == 0 {
+    let reparsed = json_parse(compact)
+    if reparsed == 0 {
         free(compact)
         json_free(root)
         return 12
     }
+    // json_stringify emits canonical form (e.g. \u0042 decodes to B), so it is
+    // byte-stable across a parse/stringify roundtrip rather than identical to
+    // the original hand-written source.
+    let compact2 = json_stringify(reparsed)
+    if string_equals(compact, compact2) == 0 {
+        free(compact)
+        free(compact2)
+        json_free(reparsed)
+        json_free(root)
+        return 12
+    }
     free(compact)
+    free(compact2)
+    json_free(reparsed)
 
     let compat_name = json_get_string(source, "name")
     if string_equals(compat_name, "sable") == 0 {

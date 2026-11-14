@@ -153,6 +153,32 @@ function int test_64bit_imm_operands() {
     return 0
 }
 
+// 10: nested pure subexpressions must not reuse a scratch register that an
+// outer frame still holds live. A non-refcounted scratch set released the
+// register early, so `(A) + (B)` for two nested pure exprs compiled B into
+// the same register that held A.
+function int test_nested_scratch_refcount() {
+    // both sides are two-level pure exprs; both R11 and R10 stay live
+    let a = ((1 | 2) ^ (3 - 4))          // 3 ^ -1 = -4
+    let b = ((5 + 6) - (7 | 8))          // 11 - 15 = -4
+    if a != -4 { return -1 }
+    if b != -4 { return -2 }
+    if (a + b) != -8 { return -3 }
+    if (a ^ b) != 0 { return -4 }
+
+    // longer chains force deeper scratch nesting
+    let c = ((1 + 2) + (3 - 4)) + ((5 * 6) - (7 ^ 8))   // 2 + 15 = 17
+    if c != 17 { return -5 }
+
+    let d = (((10 - 1) | 2) ^ (3 + 4)) + (((20 / 2) - 1) & 7)  // (11 ^ 7) + 1 = 12 + 1 = 13
+    if d != 13 { return -6 }
+
+    // the original fuzz find: a four-operand mix of nested pure exprs
+    let e = (((754 - 515) ^ (713 + 317)) - ((196 | -453) ^ (291 - 364)))  // 1257 - 328 = 929
+    if e != 929 { return -7 }
+    return 0
+}
+
 function int main() {
     // 1 & 2: view RCX preservation + pure cmp rhs
     let raw = malloc(24)
@@ -225,6 +251,12 @@ function int main() {
     // 9: 64-bit immediates must not clobber their own operand register
     if test_64bit_imm_operands() != 0 {
         return 11
+    }
+
+    // 10: nested pure exprs must not reuse an outer frame's live scratch reg
+    let nested = test_nested_scratch_refcount()
+    if nested != 0 {
+        return 12 + (-nested)
     }
 
     return 0

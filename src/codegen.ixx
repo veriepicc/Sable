@@ -1603,17 +1603,27 @@ private:
         return false;
     }
 
-    std::unordered_set<std::uint8_t> scratch_regs_in_use_;
+    // refcounted so nested ScopedScratchReg guards on the same register stack
+    // correctly; a plain set would let the inner destructor release a register
+    // the outer frame is still holding live.
+    std::unordered_map<std::uint8_t, std::size_t> scratch_regs_in_use_;
 
     struct ScopedScratchReg {
         CodeGenerator& cg;
         x64::Reg reg;
         ScopedScratchReg(CodeGenerator& cg, x64::Reg reg) : cg(cg), reg(reg) {
-            cg.scratch_regs_in_use_.insert(static_cast<std::uint8_t>(reg));
+            ++cg.scratch_regs_in_use_[static_cast<std::uint8_t>(reg)];
         }
         ~ScopedScratchReg() {
-            cg.scratch_regs_in_use_.erase(static_cast<std::uint8_t>(reg));
+            auto it = cg.scratch_regs_in_use_.find(static_cast<std::uint8_t>(reg));
+            if (it != cg.scratch_regs_in_use_.end()) {
+                if (--it->second == 0) {
+                    cg.scratch_regs_in_use_.erase(it);
+                }
+            }
         }
+        ScopedScratchReg(const ScopedScratchReg&) = delete;
+        ScopedScratchReg& operator=(const ScopedScratchReg&) = delete;
     };
 
     [[nodiscard]] bool reg_is_bound(x64::Reg reg) const {
@@ -10483,6 +10493,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
     [[nodiscard]] bool emit_condition_false_jump(const ast::Expr& condition, std::size_t& jump_patch) {
         if (auto* bin = std::get_if<ast::BinaryExpr>(&condition.kind)) {
+            if (!validate_binary_operands(*bin)) {
+                return false;
+            }
             // type-context guard for the comparison so unsigned-aware cc is selected
             BinaryOpTypeGuard cond_guard(this, infer_expr_type(*bin->lhs));
             // float comparisons can't use the integer cmp fast paths
@@ -11536,6 +11549,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         }
 
         if (auto* bin = std::get_if<ast::BinaryExpr>(&expr.kind)) {
+            if (!validate_binary_operands(*bin)) {
+                return false;
+            }
             std::int64_t rhs_imm = 0;
             if (try_get_i64_immediate(*bin->rhs, rhs_imm) && supports_binary_rhs_imm(bin->op, rhs_imm)) {
                 // fast path: lhs is a bound ident — use 3-operand imul / lea-add to avoid
@@ -12261,6 +12277,36 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         return generate_ident_into(ident, x64::Reg::RAX);
     }
 
+    // Reject str/char operands for operators that only make sense on numbers.
+    // Without this the operands decay to raw pointers and silently miscompile
+    // (str + str builds an interior pointer, str < 0 compares a pointer, etc).
+    [[nodiscard]] bool validate_binary_operands(const ast::BinaryExpr& bin) {
+        using Op = ast::BinaryExpr::Op;
+        switch (bin.op) {
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor:
+            case Op::Shl: case Op::Shr:
+            case Op::Lt: case Op::Gt: case Op::Le: case Op::Ge:
+                break;
+            default:
+                return true; // comparisons, logical, and assignment ops are fine
+        }
+        auto string_like = [](const std::optional<Type>& t) {
+            if (!t) return false;
+            if (auto* p = std::get_if<PrimitiveType>(&t->kind)) {
+                return *p == PrimitiveType::Str || *p == PrimitiveType::Char;
+            }
+            return false;
+        };
+        // only flag when we can actually see a str/char operand; unknown types stay permissive
+        if (string_like(infer_expr_type(*bin.lhs)) || string_like(infer_expr_type(*bin.rhs))) {
+            error("operator does not accept str/char operands; use string helpers "
+                  "(string_equals, string_append, text_join, mem.read8) instead");
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] bool generate_binary(const ast::BinaryExpr& bin) {
         using Op = ast::BinaryExpr::Op;
 
@@ -12289,6 +12335,13 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             return std::nullopt;
         };
         BinaryOpTypeGuard type_guard(this, pick_operand_type());
+
+        // reject string/char operands for arithmetic, bitwise and ordering ops.
+        // these currently fall through to raw pointer arithmetic and miscompile
+        // (str + str, str < 0, int + str) instead of being diagnosed.
+        if (!validate_binary_operands(bin)) {
+            return false;
+        }
 
         // try constant folding - if both operands are literals, compute at compile time
         if (auto* lhs_lit = std::get_if<ast::LiteralExpr>(&bin.lhs->kind)) {
