@@ -130,6 +130,7 @@
     <ClCompile Include="src\lexer.ixx" />
     <ClCompile Include="src\parser.ixx" />
     <ClCompile Include="src\ast.ixx" />
+    <ClCompile Include="src\warnings.ixx" />
     <ClCompile Include="src\types.ixx" />
     <ClCompile Include="src\codegen.ixx" />
     <ClCompile Include="src\x64.ixx" />
