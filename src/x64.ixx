@@ -400,6 +400,12 @@ public:
         buf_.emit8(modrm(0b11, Reg(EXT_DIV), src));
     }
 
+    void div_mem(Reg base, std::int32_t offset) {
+        buf_.emit8(rex(true, Reg::RAX, base));
+        buf_.emit8(0xF7);
+        emit_mem_operand(Reg(EXT_DIV), base, offset);
+    }
+
     // cqo - sign-extend RAX into RDX:RAX
     void cqo() {
         buf_.emit8(0x48);

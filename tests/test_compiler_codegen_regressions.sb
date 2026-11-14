@@ -259,5 +259,59 @@ function int main() {
         return 12 + (-nested)
     }
 
+    // 11: runtime division guards (no #DE fault on zero divisor or MIN/-1)
+    let dg = test_runtime_div_guards()
+    if dg != 0 {
+        return 20 + dg
+    }
+
+    // 12: null pointer indexing must not fault (reads yield 0, stores ignored)
+    let ng = test_null_index_guards()
+    if ng != 0 {
+        return 30 + ng
+    }
+
+    return 0
+}
+
+function int test_null_index_guards() {
+    let p: *int = 0 as *int
+    if p[3] != 0 { return 1 }
+    p[3] = 99              // must be ignored
+    if p[3] != 0 { return 2 }
+
+    let s: str = 0 as str
+    if s[0] != 0 { return 3 }
+
+    let b: *byte = 0 as *byte
+    if b[7] != 0 { return 4 }
+    b[7] = 5               // must be ignored
+
+    // real pointers keep working
+    let q = malloc(16) as *int
+    q[2] = 42
+    if q[2] != 42 { free(q); return 5 }
+    free(q)
+    return 0
+}
+
+// runtime div/mod must never fault: /0 and %0 yield 0, INT64_MIN/-1 wraps.
+function int test_runtime_div_guards() {
+    let zero = 0
+    let one = 1
+    let minus_one = 0 - 1
+    let min_int = 0 - 9223372036854775807 - 1
+
+    if min_int / minus_one != min_int { return 1 }
+    if min_int % minus_one != 0 { return 2 }
+    if 20 / minus_one != -20 { return 3 }
+    if 0 - 20 != 0 && (0 - 20) / minus_one != 20 { return 4 }
+    if 20 % minus_one != 0 { return 5 }
+    let q = 100 / zero
+    if q != 0 { return 6 }
+    let r = 100 % zero
+    if r != 0 { return 7 }
+    if 7 / one != 7 or 7 % one != 0 { return 8 }
+    if 0 / 500 != 0 { return 9 }
     return 0
 }

@@ -10802,36 +10802,58 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
     // Signed 64-bit divide that's safe against the INT_MIN / -1 hardware trap.
     // After the call, RAX = quotient, RDX = remainder. dividend must already be in RAX.
-    void emit_safe_idiv(x64::Reg divisor) {
-        // if divisor == -1 and rax == INT64_MIN, idiv would trap (#DE).
-        // we patch the result to (INT64_MIN, 0) to match wrapping semantics without faulting.
-        // constraint set: the dividend lives in RAX, the divisor may BE RDX (which cqo
-        // clobbers), and every other register can hold live data inside registerized
-        // loops. so: park the divisor on the stack, run the guard without touching any
-        // register, and idiv straight from memory.
+    // unsigned div/mod: guard only the zero divisor (#DE), yield 0/0.
+    // divisor lives in `divisor`; dividend must be in RAX with RDX already zeroed.
+    void emit_safe_udiv(x64::Reg divisor) {
         emit_.push(divisor);
-        emit_.cmp_mem_imm(x64::Reg::RSP, 0, -1);
-        std::size_t do_idiv = emit_.jcc_rel32(x64::Emitter::CC_NE);
-        // divisor == -1: trap only when rax == INT64_MIN. detect it on a scratch copy
-        // via shifts — shl sets CF = old bit63 and SF = old bit62; INT64_MIN is the
-        // only value with bit63=1 and bit62=0.
-        emit_.push(x64::Reg::RAX);
-        emit_.shl_imm(x64::Reg::RAX, 1);
-        std::size_t not_min_a = emit_.jcc_rel32(x64::Emitter::CC_AE);
-        std::size_t not_min_b = emit_.jcc_rel32(x64::Emitter::CC_NS);
-        // trap path: rax still holds INT64_MIN untouched; rdx:rax = (INT64_MIN, 0)
-        emit_.add_imm(x64::Reg::RSP, 8);
+        emit_.cmp_mem_imm(x64::Reg::RSP, 0, 0);
+        std::size_t nonzero = emit_.jcc_rel32(x64::Emitter::CC_NE);
+        // zero divisor: quotient 0 in RAX, remainder 0 in RDX
+        emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
         emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
         emit_.add_imm(x64::Reg::RSP, 8);
+        std::size_t done = emit_.jmp_rel32_placeholder();
+        emit_.patch_jump(nonzero);
+        emit_.div_mem(x64::Reg::RSP, 0);
+        emit_.add_imm(x64::Reg::RSP, 8);
+        emit_.patch_jump(done);
+    }
+
+    void emit_safe_idiv(x64::Reg divisor) {        // idiv traps (#DE) on two inputs: a zero divisor, and INT64_MIN / -1.
+        // neither should crash a running program, so both are guarded here and
+        // patched to a defined result.
+        //   divisor == 0   -> result 0, remainder 0
+        //   INT64_MIN / -1 -> result INT64_MIN, remainder 0
+        // constraint set: the dividend lives in RAX, the divisor may BE RDX (which
+        // cqo clobbers), and every other register can hold live data inside
+        // registerized loops. so: park the divisor on the stack, run the guards
+        // without touching any register, and idiv straight from memory.
+        emit_.push(divisor);
+
+        // zero divisor: result 0, remainder 0, skip the divide entirely
+        emit_.cmp_mem_imm(x64::Reg::RSP, 0, 0);
+        std::size_t nonzero_div = emit_.jcc_rel32(x64::Emitter::CC_NE);
+        emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
+        emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
+        emit_.add_imm(x64::Reg::RSP, 8);
+        std::size_t after_zero = emit_.jmp_rel32_placeholder();
+        emit_.patch_jump(nonzero_div);
+
+        emit_.cmp_mem_imm(x64::Reg::RSP, 0, -1);
+        std::size_t do_idiv = emit_.jcc_rel32(x64::Emitter::CC_NE);
+        // divisor == -1: negating the dividend is the quotient, and negation of
+        // INT64_MIN wraps to INT64_MIN, which is exactly the wrapping result we
+        // want. remainder is 0 either way.
+        emit_.add_imm(x64::Reg::RSP, 8); // drop the divisor copy
+        emit_.neg(x64::Reg::RAX);
+        emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
         std::size_t skip_real = emit_.jmp_rel32_placeholder();
-        emit_.patch_jump(not_min_a);
-        emit_.patch_jump(not_min_b);
-        emit_.add_imm(x64::Reg::RSP, 8); // drop the shifted copy
         emit_.patch_jump(do_idiv);
         emit_.cqo();
         emit_.idiv_mem(x64::Reg::RSP, 0);
         emit_.add_imm(x64::Reg::RSP, 8);
         emit_.patch_jump(skip_real);
+        emit_.patch_jump(after_zero);
     }
 
 
@@ -11137,7 +11159,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     emit_.mov(x64::Reg::RAX, dst);
                     if (is_unsigned) {
                         emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
-                        emit_.div(rhs);
+                        emit_safe_udiv(rhs);
                     } else {
                         if (rhs == x64::Reg::RDX) {
                         // cqo in emit_safe_idiv clobbers RDX; move the divisor somewhere
@@ -11154,7 +11176,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 }
                 if (is_unsigned) {
                     emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
-                    emit_.div(rhs);
+                    emit_safe_udiv(rhs);
                 } else {
                     if (rhs == x64::Reg::RDX) {
                         // cqo in emit_safe_idiv clobbers RDX; move the divisor somewhere
@@ -11172,7 +11194,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     emit_.mov(x64::Reg::RAX, dst);
                     if (is_unsigned) {
                         emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
-                        emit_.div(rhs);
+                        emit_safe_udiv(rhs);
                     } else {
                         if (rhs == x64::Reg::RDX) {
                         // cqo in emit_safe_idiv clobbers RDX; move the divisor somewhere
@@ -11189,7 +11211,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 }
                 if (is_unsigned) {
                     emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
-                    emit_.div(rhs);
+                    emit_safe_udiv(rhs);
                 } else {
                     if (rhs == x64::Reg::RDX) {
                         // cqo in emit_safe_idiv clobbers RDX; move the divisor somewhere
@@ -12261,13 +12283,29 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         if (!generate_expr(*idx.index)) return false;
 
         emit_.pop(x64::Reg::R11);
+        // guard the typed path only: a null base must not fault, yield a zero
+        // element instead (base in R11, index in RAX after the pop)
+        bool guarded = false;
+        std::size_t guarded_done = 0;
+        if (is_typed_raw && elem_type) {
+            emit_.test(x64::Reg::R11, x64::Reg::R11);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
+            guarded_done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
+            guarded = true;
+        }
         emit_.lea_scaled(x64::Reg::RAX, x64::Reg::R11, x64::Reg::RAX, stride);
         if (!is_typed_raw && !is_native_image_output()) {
             emit_.add_smart(x64::Reg::RAX, 8);
         }
 
         if (is_typed_raw && elem_type) {
-            return emit_load_typed_from_address_in_rax(*elem_type);
+            if (!emit_load_typed_from_address_in_rax(*elem_type)) return false;
+            if (guarded) {
+                emit_.patch_jump(guarded_done);
+            }
+            return true;
         }
         emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, 0);
         return true;
@@ -12911,19 +12949,38 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             emit_.push(x64::Reg::RAX);
             if (!generate_expr(*idx.index)) return false;
             emit_.pop(x64::Reg::R11);
+            bool guarded = false;
+            std::size_t guarded_done = 0;
+            if (is_typed_raw && elem_type) {
+                // null base must not fault: ignore the store entirely
+                emit_.test(x64::Reg::R11, x64::Reg::R11);
+                std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                // drop the saved value and exit
+                emit_.add_imm(x64::Reg::RSP, 8);
+                guarded_done = emit_.jmp_rel32_placeholder();
+                emit_.patch_jump(non_null);
+                guarded = true;
+            }
             emit_.lea_scaled(x64::Reg::RAX, x64::Reg::R11, x64::Reg::RAX, stride);
             if (!is_typed_raw && !is_native_image_output()) {
                 emit_.add_smart(x64::Reg::RAX, 8); // host fallback arrays store length at arr[0]
             }
             emit_.mov(x64::Reg::R11, x64::Reg::RAX);
             emit_.pop(x64::Reg::RAX);
-            if (is_typed_raw && elem_type && stride < 8) {
-                bool save_rcx = reg_is_bound(x64::Reg::RCX);
-                if (save_rcx) emit_.push(x64::Reg::RCX);
-                emit_.mov(x64::Reg::RCX, x64::Reg::R11);
-                bool ok = emit_store_typed_to_address_in_rcx(*elem_type);
-                if (save_rcx) emit_.pop(x64::Reg::RCX);
-                return ok;
+            if (is_typed_raw && elem_type) {
+                if (stride < 8) {
+                    bool save_rcx = reg_is_bound(x64::Reg::RCX);
+                    if (save_rcx) emit_.push(x64::Reg::RCX);
+                    emit_.mov(x64::Reg::RCX, x64::Reg::R11);
+                    if (!emit_store_typed_to_address_in_rcx(*elem_type)) return false;
+                    if (save_rcx) emit_.pop(x64::Reg::RCX);
+                } else {
+                    emit_.mov_store(x64::Reg::R11, 0, x64::Reg::RAX);
+                }
+                if (guarded) {
+                    emit_.patch_jump(guarded_done);
+                }
+                return true;
             }
             emit_.mov_store(x64::Reg::R11, 0, x64::Reg::RAX);
             return true;
