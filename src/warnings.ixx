@@ -31,6 +31,10 @@ enum class WarningKind : std::uint8_t {
     EmptyBlock,            // if/while/for/loop with an empty body
     DuplicateSwitchCase,   // same case value twice
     UnreachableSwitchCase, // a case after the default
+    UnusedImport,          // import whose members are never referenced
+    ComparisonOfBoolToInt, // bool compared against a numeric literal
+    EmptyFunctionBody,     // function with an empty body
+    LoopNeverRuns,         // for range(a, b) with a >= b and both literal
     Count,
 };
 
@@ -47,12 +51,16 @@ enum class WarningKind : std::uint8_t {
         case WarningKind::EmptyBlock:            return "empty-block";
         case WarningKind::DuplicateSwitchCase:   return "duplicate-switch-case";
         case WarningKind::UnreachableSwitchCase: return "unreachable-switch-case";
+        case WarningKind::UnusedImport:          return "unused-import";
+        case WarningKind::ComparisonOfBoolToInt: return "bool-int-compare";
+        case WarningKind::EmptyFunctionBody:     return "empty-function";
+        case WarningKind::LoopNeverRuns:         return "loop-never-runs";
         case WarningKind::Count:                 break;
     }
     return "unknown";
 }
 
-// A short human description, used by `-Whelp`.
+// A short human description, used by `-Wlist`.
 [[nodiscard]] constexpr std::string_view warning_description(WarningKind kind) {
     switch (kind) {
         case WarningKind::UnusedLocal:           return "binding is never read";
@@ -66,6 +74,10 @@ enum class WarningKind : std::uint8_t {
         case WarningKind::EmptyBlock:            return "empty control-flow body";
         case WarningKind::DuplicateSwitchCase:   return "duplicate switch case value";
         case WarningKind::UnreachableSwitchCase: return "switch case after the default";
+        case WarningKind::UnusedImport:          return "imported module is never referenced";
+        case WarningKind::ComparisonOfBoolToInt: return "bool compared against an integer literal";
+        case WarningKind::EmptyFunctionBody:     return "function body is empty";
+        case WarningKind::LoopNeverRuns:         return "literal range makes the loop dead";
         case WarningKind::Count:                 break;
     }
     return "";
@@ -168,8 +180,26 @@ public:
     explicit Analyzer(const WarningPolicy& policy) : policy_(policy) {}
 
     [[nodiscard]] WarningResult analyze(const ast::Module& module) {
+        // pass 1: collect enums, imports, and referenced top-level names
         for (const auto& decl : module.decls) {
             analyze_decl(*decl, decl->span);
+        }
+        // pass 2: walk function bodies (imports are marked used here)
+        for (const auto& decl : module.decls) {
+            if (decl->is<ast::FnDecl>()) {
+                analyze_fn(decl->as<ast::FnDecl>(), decl->span);
+            } else if (decl->is<ast::ClassDecl>()) {
+                for (const auto& m : decl->as<ast::ClassDecl>().methods) {
+                    analyze_fn_body(m.name, m.params, m.body, decl->span);
+                }
+            }
+        }
+        // report unused imports
+        for (const auto& [name, b] : import_bindings_) {
+            if (!b.used) {
+                report(WarningKind::UnusedImport, b.span,
+                       std::format("import '{}' is never used", b.path));
+            }
         }
         WarningResult result;
         for (auto& d : diagnostics_) {
@@ -198,6 +228,7 @@ private:
         SourceSpan span{};
         BindingKind kind = BindingKind::Let;
         bool used = false;
+        bool is_bool = false;
     };
 
     struct Scope {
@@ -211,7 +242,6 @@ private:
     Scope* scope_ = nullptr;
     std::vector<std::unique_ptr<Scope>> scopes_;
     SourceSpan fallback_span_{};  // enclosing statement span, for expr diagnostics
-
     // ---- scope helpers -----------------------------------------------------
 
     void push_scope() {
@@ -244,6 +274,9 @@ private:
     }
 
     void mark_used(const std::string& name) {
+        if (auto it = import_bindings_.find(name); it != import_bindings_.end()) {
+            it->second.used = true;
+        }
         for (Scope* s = scope_; s != nullptr; s = s->parent) {
             if (auto it = s->bindings.find(name); it != s->bindings.end()) {
                 it->second.used = true;
@@ -304,16 +337,31 @@ private:
 
     // ---- declarations ------------------------------------------------------
 
+    // top-level names referenced anywhere (used for unused-import detection)
+    std::unordered_set<std::string> referenced_names_;
+    // imports seen, keyed by the bound name
+    struct ImportBinding { std::string bound_name; std::string path; SourceSpan span{}; bool used = false; };
+    std::unordered_map<std::string, ImportBinding> import_bindings_;
+
     void analyze_decl(const ast::Decl& decl, const SourceSpan& decl_span) {
         std::visit(detail::overloaded{
-            [&](const ast::FnDecl& fn) { analyze_fn(fn, decl_span); },
-            [&](const ast::ClassDecl& cls) {
-                for (const auto& m : cls.methods) {
-                    analyze_fn_body(m.name, m.params, m.body, decl_span);
-                }
+            [&](const ast::ImportDecl& imp) {
+                std::string bound = imp.alias ? *imp.alias : last_path_component(imp.path);
+                ImportBinding b;
+                b.bound_name = bound;
+                b.path = imp.path;
+                b.span = decl_span;
+                import_bindings_[bound] = std::move(b);
             },
             [&](const auto&) {},
         }, decl.kind);
+    }
+
+    static std::string last_path_component(const std::string& path) {
+        if (auto pos = path.find_last_of("./"); pos != std::string::npos) {
+            return path.substr(pos + 1);
+        }
+        return path;
     }
 
     void analyze_fn(const ast::FnDecl& fn, const SourceSpan& decl_span) {
@@ -326,6 +374,10 @@ private:
     void analyze_fn_body(const std::string& name, const ast::ParamList& params,
                          const ast::StmtSuite& body, const SourceSpan& fn_span) {
         (void)name;
+        if (body.stmts.empty()) {
+            report(WarningKind::EmptyFunctionBody, fn_span,
+                   std::format("function '{}' has an empty body", name));
+        }
         SourceSpan saved_fallback = fallback_span_;
         fallback_span_ = fn_span;
         push_scope();
@@ -335,6 +387,9 @@ private:
             b.kind = BindingKind::Parameter;
             b.span = fn_span;
             b.used = (p.name == "self" || p.name.starts_with("_"));
+            if (auto* prim = std::get_if<PrimitiveType>(&p.type.kind)) {
+                b.is_bool = (*prim == PrimitiveType::Bool);
+            }
             scope_->bindings[p.name] = b;
         }
         analyze_suite(body);
@@ -397,7 +452,10 @@ private:
                 pop_scope();
             },
             [&](const ast::ForStmt& s) {
-                if (s.iterable) analyze_expr(*s.iterable);
+                if (s.iterable) {
+                    analyze_expr(*s.iterable);
+                    check_loop_bounds(s, stmt_span);
+                }
                 push_scope();
                 declare(s.name, stmt_span, BindingKind::LoopVar);
                 if (s.body.stmts.empty()) {
@@ -448,6 +506,21 @@ private:
             check_implicit_narrowing(*s.init, s.type, span, s.name);
         }
         declare(s.name, span, BindingKind::Let);
+        // remember whether this binding is a bool, for bool-int-compare
+        if (s.init) {
+            if (auto* lit = std::get_if<ast::LiteralExpr>(&s.init->kind)) {
+                if (std::holds_alternative<bool>(lit->value)) {
+                    scope_->bindings[s.name].is_bool = true;
+                }
+            }
+        }
+        if (s.type) {
+            if (auto* prim = std::get_if<PrimitiveType>(&s.type->kind)) {
+                if (*prim == PrimitiveType::Bool) {
+                    scope_->bindings[s.name].is_bool = true;
+                }
+            }
+        }
     }
 
     void analyze_if(const ast::IfStmt& s, const SourceSpan& span) {
@@ -581,11 +654,87 @@ private:
         }, expr.kind);
     }
 
+    // range(a, b) with both literal and a >= b is an empty loop
+    void check_loop_bounds(const ast::ForStmt& s, const SourceSpan& span) {
+        auto* call = std::get_if<ast::CallExpr>(&s.iterable->kind);
+        if (!call || call->args.size() != 2 || !call->callee->is<ast::IdentExpr>()) {
+            return;
+        }
+        const auto& fname = call->callee->as<ast::IdentExpr>().name;
+        if (fname != "range" && fname != "rangeto") {
+            return;
+        }
+        std::int64_t lo = 0;
+        std::int64_t hi = 0;
+        if (try_literal_i64(*call->args[0], lo) && try_literal_i64(*call->args[1], hi) && lo >= hi) {
+            report(WarningKind::LoopNeverRuns, span,
+                   std::format("range({}, {}) is empty; the loop body never runs", lo, hi));
+        }
+    }
+
+    [[nodiscard]] static bool try_literal_i64(const ast::Expr& expr, std::int64_t& out) {
+        if (auto* lit = std::get_if<ast::LiteralExpr>(&expr.kind)) {
+            if (auto* i = std::get_if<std::int64_t>(&lit->value)) { out = *i; return true; }
+            if (auto* u = std::get_if<std::uint64_t>(&lit->value)) {
+                out = static_cast<std::int64_t>(*u);
+                return true;
+            }
+        }
+        if (auto* un = std::get_if<ast::UnaryExpr>(&expr.kind);
+            un && un->op == ast::UnaryExpr::Op::Neg && un->operand) {
+            std::int64_t inner = 0;
+            if (try_literal_i64(*un->operand, inner)) { out = -inner; return true; }
+        }
+        return false;
+    }
+
     void analyze_binary(const ast::BinaryExpr& e, const SourceSpan& span) {
         if (e.lhs) analyze_expr(*e.lhs);
         if (e.rhs) analyze_expr(*e.rhs);
 
         using Op = ast::BinaryExpr::Op;
+
+        // bool compared against an integer literal
+        if (e.lhs && e.rhs) {
+            auto bool_side = [](const ast::Expr& ex) -> bool {
+                if (auto* lit = std::get_if<ast::LiteralExpr>(&ex.kind)) {
+                    return std::holds_alternative<bool>(lit->value);
+                }
+                return false;
+            };
+            auto int_side = [](const ast::Expr& ex) -> bool {
+                if (auto* lit = std::get_if<ast::LiteralExpr>(&ex.kind)) {
+                    return std::holds_alternative<std::int64_t>(lit->value) ||
+                           std::holds_alternative<std::uint64_t>(lit->value);
+                }
+                return false;
+            };
+            const bool cmp = e.op == Op::Eq || e.op == Op::Ne || e.op == Op::Lt ||
+                             e.op == Op::Gt || e.op == Op::Le || e.op == Op::Ge;
+            if (cmp && ((bool_side(*e.lhs) && int_side(*e.rhs)) ||
+                        (int_side(*e.lhs) && bool_side(*e.rhs)))) {
+                report(WarningKind::ComparisonOfBoolToInt, span,
+                       "bool compared against an integer literal");
+            } else if (cmp) {
+                // ident/expr whose declared type is bool, compared with an int literal
+                auto ident_is_bool = [&](const ast::Expr& ex) -> bool {
+                    if (auto* id = std::get_if<ast::IdentExpr>(&ex.kind)) {
+                        for (Scope* s = scope_; s != nullptr; s = s->parent) {
+                            if (auto it = s->bindings.find(id->name); it != s->bindings.end()) {
+                                return it->second.is_bool;
+                            }
+                        }
+                    }
+                    return false;
+                };
+                if ((ident_is_bool(*e.lhs) && int_side(*e.rhs)) ||
+                    (int_side(*e.lhs) && ident_is_bool(*e.rhs))) {
+                    report(WarningKind::ComparisonOfBoolToInt, span,
+                           "bool value compared against an integer literal");
+                }
+            }
+        }
+
         if (e.lhs && e.rhs && e.lhs->is<ast::IdentExpr>() && e.rhs->is<ast::IdentExpr>()) {
             const auto& l = e.lhs->as<ast::IdentExpr>().name;
             const auto& r = e.rhs->as<ast::IdentExpr>().name;

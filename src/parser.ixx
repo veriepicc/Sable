@@ -2484,6 +2484,7 @@ private:
 
     std::optional<ast::DeclPtr> parse_import_decl() {
         Token path_tok = consume_name("expected module path");
+        SourceLoc import_start = path_tok.loc;
         std::string path(path_tok.text);
         // manual dot-separated path concatenation: could use a join utility but keeping it inline for now
         while (match(TokenKind::Dot)) {
@@ -2505,6 +2506,7 @@ private:
             .path = std::move(path),
             .alias = std::move(alias)
         };
+        decl->span.start = import_start;
         return decl;
     }
 

@@ -33,13 +33,17 @@ Rules:
 | :--- | :--- |
 | `-Wunused-local` | a `let`/`var` binding is never read |
 | `-Wunused-parameter` | a function parameter is never read |
+| `-Wunused-import` | an imported module is never referenced |
 | `-Wshadowed-variable` | a binding shadows an outer binding |
 | `-Wunreachable-code` | a statement follows `return`/`break`/`continue` |
 | `-Wimplicit-narrowing` | a signed value is assigned to a narrower unsigned type |
 | `-Wself-assignment` | `x = x`, `x -= x`, `x /= x`, `x %= x` |
 | `-Wredundant-compare` | a value is compared with itself |
+| `-Wbool-int-compare` | a `bool` is compared against an integer literal |
 | `-Wconst-condition` | an `if`/`while` condition is a literal |
 | `-Wempty-block` | an `if`/`while`/`for`/`loop` has an empty body |
+| `-Wempty-function` | a function body is empty |
+| `-Wloop-never-runs` | a literal `range(a, b)` with `a >= b` can never iterate |
 | `-Wduplicate-switch-case` | the same `case` value appears twice |
 | `-Wunreachable-switch-case` | a `case` appears after the default `else` |
 
@@ -73,3 +77,15 @@ warning: f.sb:1:30: unused parameter 'not_used' [unused-parameter]
   positions fall back to the enclosing statement, which is always located.
 - Warnings are independent of the "possible leak" ownership diagnostics, which
   are always on.
+
+## Hard errors
+
+Some conditions are always bugs and are rejected outright, not warned about:
+
+- dividing or taking a modulo by a literal `0`
+- using `str`/`char` operands with arithmetic, bitwise, or ordering operators
+  (`str < 0`, `int + str`, `str + str`) — use the string helpers instead
+- rebinding an immutable binding, or writing to a `for`/`parallel for` loop
+  variable
+- revisiting an already-freed binding (use-after-free), double free
+- calling a builtin with the wrong number of arguments

@@ -12408,6 +12408,17 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                   "(string_equals, string_append, text_join, mem.read8) instead");
             return false;
         }
+
+        // division / modulo by a literal zero always faults at runtime (#DE).
+        if (bin.op == Op::Div || bin.op == Op::Mod) {
+            std::int64_t rhs_imm = 0;
+            if (try_get_i64_immediate(*bin.rhs, rhs_imm) && rhs_imm == 0) {
+                error(bin.op == Op::Div
+                          ? "division by zero: the divisor is a literal 0"
+                          : "modulo by zero: the divisor is a literal 0");
+                return false;
+            }
+        }
         return true;
     }
 
