@@ -1,0 +1,71 @@
+import text
+
+// This file deliberately triggers several warning kinds. It must still compile
+// and run identically with warnings off (the default), and each -W flag should
+// surface the matching diagnostic. Warnings never change generated code.
+
+function int shadow_and_unused() {
+    let outer = 10
+    let unused_local = 99        // unused-local
+    if outer > 0 {
+        let outer = 20           // shadowed-variable (shadows the outer `outer`)
+        return outer
+    }
+    return outer
+}
+
+function int unused_param_fn(int used, int not_used) {   // unused-parameter
+    return used
+}
+
+function int const_and_empty() {
+    if 1 {                       // const-condition
+        return 7
+    }
+    var n = 0
+    while false {                // const-condition
+        n++
+    }
+    return n
+}
+
+function int self_ops() {
+    var a = 5
+    a = a                        // self-assignment
+    let b = 3
+    if b == b {                  // redundant-compare
+        return a
+    }
+    return 0
+}
+
+function int unreachable_after_return() {
+    return 1
+    let dead = 2                 // unreachable-code
+    return dead
+}
+
+function int switch_issues(int mode) {
+    switch mode {
+    case 1:
+        return 10
+    case 1:                      // duplicate-switch-case
+        return 11
+    else:
+        return 0
+    }
+}
+
+fn main() -> int {
+    let s = shadow_and_unused()
+    let u = unused_param_fn(1, 2)
+    let c = const_and_empty()
+    let so = self_ops()
+    let sw = switch_issues(1)
+    if s != 20 { return 1 }
+    if u != 1 { return 2 }
+    if c != 7 { return 3 }
+    if so != 5 { return 4 }
+    if sw != 10 { return 5 }
+    return 0
+}

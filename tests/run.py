@@ -27,10 +27,13 @@ def command(binary, *args):
 
 
 def invoke(argv, cwd, timeout):
-    # wine daemons can inherit pipes and keep communicate blocked after exit
-    with tempfile.TemporaryFile() as output:
-        proc = subprocess.Popen(argv, cwd=cwd, env=os.environ.copy(), stdout=output,
-                                stderr=subprocess.STDOUT, start_new_session=os.name != 'nt')
+    # wine daemons can inherit pipes and keep communicate blocked after exit.
+    # capture stdout and stderr separately: program output is stdout, diagnostics
+    # are stderr, and tests compare stdout only. proc.stdout stays the merged
+    # text so crash detection and rejection checks still see both streams.
+    with tempfile.TemporaryFile() as out_file, tempfile.TemporaryFile() as err_file:
+        proc = subprocess.Popen(argv, cwd=cwd, env=os.environ.copy(), stdout=out_file,
+                                stderr=err_file, start_new_session=os.name != 'nt')
         try:
             proc.wait(timeout=timeout)
         except (subprocess.TimeoutExpired, KeyboardInterrupt):
@@ -44,9 +47,15 @@ def invoke(argv, cwd, timeout):
                     pass
             proc.wait(timeout=10)
             raise
-        output.seek(0)
-        text = output.read().decode('utf-8', errors='replace')
-    return subprocess.CompletedProcess(argv, proc.returncode, text)
+        out_file.seek(0)
+        err_file.seek(0)
+        stdout_text = out_file.read().decode('utf-8', errors='replace')
+        stderr_text = err_file.read().decode('utf-8', errors='replace')
+    merged = stdout_text if not stderr_text else stdout_text + stderr_text
+    result = subprocess.CompletedProcess(argv, proc.returncode, merged)
+    result.stdout_only = stdout_text
+    result.stderr_only = stderr_text
+    return result
 
 
 def check_crash(proc):
@@ -182,8 +191,9 @@ def execute(case, compiler, workspace, timeout):
             if proc.returncode != 0:
                 raise AssertionError(f'compile/run exit {proc.returncode}\n{proc.stdout}')
             if kind == 'run':
-                if proc.returncode != case['ExpectedExit'] or normalize(proc.stdout) != normalize(case['ExpectedOutput']):
-                    raise AssertionError(f"expected output {case['ExpectedOutput']!r}, got {proc.stdout!r}")
+                run_stdout = getattr(proc, 'stdout_only', proc.stdout)
+                if proc.returncode != case['ExpectedExit'] or normalize(run_stdout) != normalize(case['ExpectedOutput']):
+                    raise AssertionError(f"expected output {case['ExpectedOutput']!r}, got {run_stdout!r}")
             else:
                 exe = workspace / case['ExeFile'] if kind == 'project' else source.with_suffix('.exe')
                 if not exe.is_file():

@@ -1794,6 +1794,13 @@
   },
   {
     "kind": "stress",
+    "Name": "test_warnings",
+    "File": "tests/test_warnings.sb",
+    "ExpectedExit": 0,
+    "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
     "Name": "test_scripting_ergonomics",
     "File": "tests/test_scripting_ergonomics.sb",
     "ExpectedExit": 0,

@@ -20,6 +20,7 @@ export import sable.codegen;
 export import sable.x64;
 export import sable.pe;
 export import sable.errors;
+export import sable.warnings;
 
 import std;
 
@@ -515,6 +516,7 @@ struct CompileOptions {
     bool collect_timings = false;
     bool collect_function_offsets = true;
     bool vectorize = true;
+    warnings::WarningPolicy warning_policy{};
 };
 
 struct TimingEntry {
@@ -613,6 +615,24 @@ public:
         }
 
         ast::Module& mod = *mod_result;
+
+        // static warning analysis (runs even when all warnings are off; the
+        // policy decides what gets reported)
+        auto warn_start = now();
+        warnings::Analyzer analyzer(opts.warning_policy);
+        auto warn_result = analyzer.analyze(mod);
+        for (auto& w : warn_result.warnings) {
+            result.warnings.push_back(std::move(w));
+        }
+        for (auto& e : warn_result.errors) {
+            result.errors.push_back(std::move(e));
+        }
+        if (opts.collect_timings) {
+            append_timing(result.timings, "warnings.analyze", elapsed_ms(warn_start, now()));
+        }
+        if (!result.errors.empty()) {
+            return result;
+        }
 
         auto codegen_setup_start = now();
         CodeGenerator codegen;
@@ -761,6 +781,10 @@ public:
 
         if (!result.main_offset) {
             return std::unexpected("no main function found");
+        }
+
+        for (const auto& warning : result.warnings) {
+            std::print(std::cerr, "\033[1;93mwarning:\033[0m {}\n", warning);
         }
 
         #ifdef _WIN32
