@@ -1,0 +1,412 @@
+import mem
+
+// Hex and Base64 codecs over raw bytes and strings.
+//
+// Everything here round-trips: decode(encode(x)) == x for the byte ranges these
+// functions accept. Byte-oriented entry points take (ptr, len); the string
+// convenience wrappers operate on the string's raw bytes, so a string containing
+// a NUL byte still encodes fully (length comes from string_length, not strlen).
+//
+// Ownership: every function that returns `str` returns a fresh heap string; the
+// caller must free it. `*_into` variants write into a caller-supplied buffer and
+// allocate nothing.
+
+// ---- hex -------------------------------------------------------------------
+
+let CODEC_HEX_LOWER: str = "0123456789abcdef"
+let CODEC_HEX_UPPER: str = "0123456789ABCDEF"
+
+function int codec_hex_char_value(int ch) {
+    if ch >= 48 && ch <= 57 {
+        return ch - 48
+    }
+    if ch >= 97 && ch <= 102 {
+        return 10 + (ch - 97)
+    }
+    if ch >= 65 && ch <= 70 {
+        return 10 + (ch - 65)
+    }
+    return 0 - 1
+}
+
+// number of characters hex_encode_bytes will produce
+function int codec_hex_encoded_len(int len) {
+    if len <= 0 {
+        return 0
+    }
+    return len * 2
+}
+
+// number of bytes hex_decode_to_bytes will produce for `len` input chars
+function int codec_hex_decoded_len(int len) {
+    if len <= 0 {
+        return 0
+    }
+    return (len + 1) / 2
+}
+
+// encode bytes as lowercase hex into a caller buffer. returns chars written.
+function int codec_hex_encode_into(ptr dst, ptr src, int len) {
+    if dst == 0 || src == 0 || len <= 0 {
+        return 0
+    }
+    let digits = CODEC_HEX_LOWER
+    var w = 0
+    var i = 0
+    while i < len {
+        let byte_value = mem.read8(src + i) & 0xFF
+        mem.write8(dst + w, mem.read8((digits as ptr) + (byte_value >> 4)))
+        mem.write8(dst + w + 1, mem.read8((digits as ptr) + (byte_value & 15)))
+        w = w + 2
+        i++
+    }
+    return w
+}
+
+function int codec_hex_encode_upper_into(ptr dst, ptr src, int len) {
+    if dst == 0 || src == 0 || len <= 0 {
+        return 0
+    }
+    let digits = CODEC_HEX_UPPER
+    var w = 0
+    var i = 0
+    while i < len {
+        let byte_value = mem.read8(src + i) & 0xFF
+        mem.write8(dst + w, mem.read8((digits as ptr) + (byte_value >> 4)))
+        mem.write8(dst + w + 1, mem.read8((digits as ptr) + (byte_value & 15)))
+        w = w + 2
+        i++
+    }
+    return w
+}
+
+// encode bytes as lowercase hex; returns a fresh heap string
+function str codec_hex_encode(ptr src, int len) {
+    var result = 0 as ptr
+    if src != 0 && len > 0 {
+        let block = malloc(codec_hex_encoded_len(len) + 1)
+        if block != 0 {
+            let written = codec_hex_encode_into(block, src, len)
+            mem.write8(block + written, 0)
+            result = block
+        }
+    }
+    return codec_result_string(result)
+}
+
+function str codec_hex_encode_upper(ptr src, int len) {
+    var result = 0 as ptr
+    if src != 0 && len > 0 {
+        let block = malloc(codec_hex_encoded_len(len) + 1)
+        if block != 0 {
+            let written = codec_hex_encode_upper_into(block, src, len)
+            mem.write8(block + written, 0)
+            result = block
+        }
+    }
+    return codec_result_string(result)
+}
+
+// turn a freshly-allocated buffer (or a null on failure) into a str, producing an
+// owned empty string when the allocation did not happen
+function str codec_result_string(ptr block) {
+    if block == 0 {
+        return make_string("")
+    }
+    return block as str
+}
+
+// decode hex characters into a caller buffer. non-hex characters are skipped so
+// "0x-1a" still decodes; an odd trailing nibble is treated as the high nibble.
+// returns bytes written.
+function int codec_hex_decode_to_bytes(ptr dst, str hex_text) {
+    if dst == 0 || hex_text == 0 {
+        return 0
+    }
+    let len = string_length(hex_text)
+    var src = hex_text as ptr
+    var high = 0 - 1
+    var w = 0
+    var i = 0
+    while i < len {
+        let nibble = codec_hex_char_value(mem.read8(src + i) & 0xFF)
+        if nibble >= 0 {
+            if high < 0 {
+                high = nibble
+            } else {
+                mem.write8(dst + w, (high << 4) | nibble)
+                w = w + 1
+                high = 0 - 1
+            }
+        }
+        i++
+    }
+    if high >= 0 {
+        // an odd number of nibbles: the last one is the high nibble of a byte
+        mem.write8(dst + w, high << 4)
+        w = w + 1
+    }
+    return w
+}
+
+// decode hex into a fresh heap block of raw bytes. Because a native-image `str`
+// is NUL-terminated, the byte count cannot be recovered from the string once a
+// 0x00 byte appears: for binary data use codec_hex_decode_to_bytes into a buffer
+// you size with codec_hex_decoded_len, which returns the true byte count.
+function str codec_hex_decode(str hex_text) {
+    var result = 0 as ptr
+    if hex_text != 0 {
+        let chars = string_length(hex_text)
+        if chars > 0 {
+            let block = malloc(codec_hex_decoded_len(chars) + 1)
+            if block != 0 {
+                let written = codec_hex_decode_to_bytes(block, hex_text)
+                mem.write8(block + written, 0)
+                result = block
+            }
+        }
+    }
+    return codec_result_string(result)
+}
+
+// length in bytes that codec_hex_decode produced (hex chars / 2, rounded up)
+function int codec_hex_decoded_length_of(str hex_text) {
+    if hex_text == 0 {
+        return 0
+    }
+    var count = 0
+    let len = string_length(hex_text)
+    var i = 0
+    while i < len {
+        if codec_hex_char_value(mem.read8((hex_text as ptr) + i) & 0xFF) >= 0 {
+            count = count + 1
+        }
+        i++
+    }
+    return (count + 1) / 2
+}
+
+// ---- base64 ----------------------------------------------------------------
+
+let CODEC_B64_PAD: int = 61   // '='
+
+function int codec_b64_char(int index) {
+    if index < 26 {
+        return 65 + index
+    }
+    if index < 52 {
+        return 97 + (index - 26)
+    }
+    if index < 62 {
+        return 48 + (index - 52)
+    }
+    if index == 62 {
+        return 43   // '+'
+    }
+    return 47       // '/'
+}
+
+function int codec_b64_value(int ch) {
+    if ch >= 65 && ch <= 90 {
+        return ch - 65
+    }
+    if ch >= 97 && ch <= 122 {
+        return 26 + (ch - 97)
+    }
+    if ch >= 48 && ch <= 57 {
+        return 52 + (ch - 48)
+    }
+    if ch == 43 {
+        return 62
+    }
+    if ch == 47 {
+        return 63
+    }
+    return 0 - 1
+}
+
+// characters base64_encode_bytes produces (including '=' padding)
+function int codec_b64_encoded_len(int len) {
+    if len <= 0 {
+        return 0
+    }
+    return ((len + 2) / 3) * 4
+}
+
+// upper bound on bytes a base64 string of `chars` characters can decode to
+function int codec_b64_decoded_len(int chars) {
+    if chars <= 0 {
+        return 0
+    }
+    return ((chars + 3) / 4) * 3
+}
+
+// encode bytes as standard base64 with '=' padding. returns chars written.
+function int codec_b64_encode_into(ptr dst, ptr src, int len) {
+    if dst == 0 || src == 0 || len <= 0 {
+        return 0
+    }
+    var w = 0
+    var i = 0
+    while i < len {
+        let b0 = mem.read8(src + i) & 0xFF
+        var b1 = 0
+        var b2 = 0
+        let have1 = i + 1 < len
+        let have2 = i + 2 < len
+        if have1 {
+            b1 = mem.read8(src + i + 1) & 0xFF
+        }
+        if have2 {
+            b2 = mem.read8(src + i + 2) & 0xFF
+        }
+        mem.write8(dst + w, codec_b64_char((b0 >> 2) & 63))
+        mem.write8(dst + w + 1, codec_b64_char(((b0 & 3) << 4) | ((b1 >> 4) & 15)))
+        if have1 {
+            mem.write8(dst + w + 2, codec_b64_char(((b1 & 15) << 2) | ((b2 >> 6) & 3)))
+        } else {
+            mem.write8(dst + w + 2, CODEC_B64_PAD)
+        }
+        if have2 {
+            mem.write8(dst + w + 3, codec_b64_char(b2 & 63))
+        } else {
+            mem.write8(dst + w + 3, CODEC_B64_PAD)
+        }
+        w = w + 4
+        i = i + 3
+    }
+    return w
+}
+
+function str codec_b64_encode(ptr src, int len) {
+    var result = 0 as ptr
+    if src != 0 && len > 0 {
+        let block = malloc(codec_b64_encoded_len(len) + 1)
+        if block != 0 {
+            let written = codec_b64_encode_into(block, src, len)
+            mem.write8(block + written, 0)
+            result = block
+        }
+    }
+    return codec_result_string(result)
+}
+
+// encode a string's raw bytes as base64
+function str codec_b64_encode_str(str text_value) {
+    if text_value == 0 {
+        return make_string("")
+    }
+    return codec_b64_encode(text_value as ptr, string_length(text_value))
+}
+
+// decode base64 into a caller buffer. '=' padding and any non-alphabet character
+// are ignored, so a wrapped/multi-line blob still decodes. returns bytes written.
+function int codec_b64_decode_to_bytes(ptr dst, str b64_text) {
+    if dst == 0 || b64_text == 0 {
+        return 0
+    }
+    let len = string_length(b64_text)
+    var src = b64_text as ptr
+    var accumulator = 0
+    var bits = 0
+    var w = 0
+    var i = 0
+    while i < len {
+        let value_of = codec_b64_value(mem.read8(src + i) & 0xFF)
+        if value_of >= 0 {
+            accumulator = (accumulator << 6) | value_of
+            bits = bits + 6
+            if bits >= 8 {
+                bits = bits - 8
+                mem.write8(dst + w, (accumulator >> bits) & 0xFF)
+                w = w + 1
+            }
+        }
+        i++
+    }
+    return w
+}
+
+// decode base64 into a fresh heap block of raw bytes. As with hex, the byte count
+// is not recoverable from a NUL-terminated str once a 0x00 byte appears, so for
+// binary data decode with codec_b64_decode_to_bytes into a buffer sized with
+// codec_b64_decoded_len; that variant returns the true byte count.
+function str codec_b64_decode(str b64_text) {
+    var result = 0 as ptr
+    if b64_text != 0 {
+        let chars = string_length(b64_text)
+        if chars > 0 {
+            let block = malloc(codec_b64_decoded_len(chars) + 1)
+            if block != 0 {
+                let written = codec_b64_decode_to_bytes(block, b64_text)
+                mem.write8(block + written, 0)
+                result = block
+            }
+        }
+    }
+    return codec_result_string(result)
+}
+
+// number of bytes a base64 string decodes to, ignoring padding and non-alphabet
+function int codec_b64_decoded_length_of(str b64_text) {
+    if b64_text == 0 {
+        return 0
+    }
+    var symbols = 0
+    let len = string_length(b64_text)
+    var i = 0
+    while i < len {
+        if codec_b64_value(mem.read8((b64_text as ptr) + i) & 0xFF) >= 0 {
+            symbols = symbols + 1
+        }
+        i++
+    }
+    return (symbols * 6) / 8
+}
+
+// ---- round-trip helpers ----------------------------------------------------
+
+// true when two raw byte ranges are equal in length and content
+function bool codec_bytes_equal(ptr a, int len_a, ptr b, int len_b) {
+    if len_a != len_b {
+        return false
+    }
+    if len_a <= 0 {
+        return true
+    }
+    if a == 0 || b == 0 {
+        return false
+    }
+    return memcmp(a, b, len_a) == 0
+}
+
+// true when `bytes` (length `len`) survives a hex encode/decode round trip
+function bool codec_hex_roundtrip(ptr bytes, int len) {
+    var outcome = false
+    if bytes != 0 && len > 0 {
+        let encoded = codec_hex_encode(bytes, len)
+        let dst = malloc(codec_hex_decoded_len(string_length(encoded)) + 1)
+        if dst != 0 {
+            let written = codec_hex_decode_to_bytes(dst, encoded)
+            outcome = codec_bytes_equal(dst, written, bytes, len)
+            free(dst)
+        }
+        free(encoded)
+    }
+    return outcome
+}
+
+function bool codec_b64_roundtrip(ptr bytes, int len) {
+    var outcome = false
+    if bytes != 0 && len > 0 {
+        let encoded = codec_b64_encode(bytes, len)
+        let dst = malloc(codec_b64_decoded_len(string_length(encoded)) + 1)
+        if dst != 0 {
+            let written = codec_b64_decode_to_bytes(dst, encoded)
+            outcome = codec_bytes_equal(dst, written, bytes, len)
+            free(dst)
+        }
+        free(encoded)
+    }
+    return outcome
+}

@@ -1,0 +1,264 @@
+import codec
+import mem
+
+// correctness of stdlib/codec.sb: hex and base64 encode/decode plus round-trips,
+// checked against known encodings and against each other.
+
+function bool str_eq(str a, str b) {
+    return string_equals(a, b) != 0
+}
+
+function int test_hex_known() {
+    // "Man" -> 4d616e
+    let s = "Man"
+    let enc = codec_hex_encode(s as ptr, 3)
+    if !str_eq(enc, "4d616e") { print("FAIL hex enc: "); println(enc); free(enc); return 1 }
+    free(enc)
+
+    let up = codec_hex_encode_upper(s as ptr, 3)
+    if !str_eq(up, "4D616E") { print("FAIL hex upper\n"); free(up); return 2 }
+    free(up)
+
+    // "" -> ""
+    let empty = codec_hex_encode(s as ptr, 0)
+    if !str_eq(empty, "") { print("FAIL hex empty\n"); free(empty); return 3 }
+    free(empty)
+
+    // single byte edge: 0x00 and 0xFF
+    let buf = mem.make_zero(2)
+    mem.write8(buf, 0)
+    mem.write8(buf + 1, 0xFF)
+    let edge = codec_hex_encode(buf, 2)
+    if !str_eq(edge, "00ff") { print("FAIL hex edge: "); println(edge); free(edge); free(buf); return 4 }
+    free(edge)
+    free(buf)
+    return 0
+}
+
+function int test_hex_decode() {
+    let dec = codec_hex_decode("4d616e")
+    if string_length(dec) != 3 { print("FAIL hex dec len\n"); free(dec); return 1 }
+    if (dec as *u8)[0] != 77 { print("FAIL hex dec byte0\n"); free(dec); return 2 }
+    if (dec as *u8)[1] != 97 { print("FAIL hex dec byte1\n"); free(dec); return 3 }
+    if (dec as *u8)[2] != 110 { print("FAIL hex dec byte2\n"); free(dec); return 4 }
+    free(dec)
+
+    // non-hex separators (colons, dashes, spaces) are ignored: a MAC-style blob
+    let noisy = codec_hex_decode("4d:61-6e")
+    if string_length(noisy) != 3 { print("FAIL hex noisy\n"); free(noisy); return 5 }
+    if (noisy as *u8)[2] != 110 { print("FAIL hex noisy byte\n"); free(noisy); return 6 }
+    free(noisy)
+
+    // odd nibble count: the last nibble becomes the high nibble
+    let odd = codec_hex_decode("abc")
+    if string_length(odd) != 2 { print("FAIL hex odd len\n"); free(odd); return 7 }
+    if (odd as *u8)[0] != 0xab { print("FAIL hex odd b0\n"); free(odd); return 8 }
+    if (odd as *u8)[1] != 0xc0 { print("FAIL hex odd b1\n"); free(odd); return 9 }
+    free(odd)
+    return 0
+}
+
+function int test_b64_known() {
+    // "Man" -> "TWFu"; "Ma" -> "TWE="; "M" -> "TQ=="
+    let m = "Man"
+    let e1 = codec_b64_encode(m as ptr, 3)
+    if !str_eq(e1, "TWFu") { print("FAIL b64 Man: "); println(e1); free(e1); return 1 }
+    free(e1)
+
+    let ma = "Ma"
+    let e2 = codec_b64_encode(ma as ptr, 2)
+    if !str_eq(e2, "TWE=") { print("FAIL b64 Ma\n"); free(e2); return 2 }
+    free(e2)
+
+    let single = "M"
+    let e3 = codec_b64_encode(single as ptr, 1)
+    if !str_eq(e3, "TQ==") { print("FAIL b64 M\n"); free(e3); return 3 }
+    free(e3)
+
+    // "hello world" -> "aGVsbG8gd29ybGQ="
+    let hw = "hello world"
+    let e4 = codec_b64_encode_str(hw)
+    if !str_eq(e4, "aGVsbG8gd29ybGQ=") { print("FAIL b64 hello: "); println(e4); free(e4); return 4 }
+    free(e4)
+    return 0
+}
+
+function int test_b64_decode() {
+    let dec = codec_b64_decode("TWFu")
+    if string_length(dec) != 3 { print("FAIL b64 dec len\n"); free(dec); return 1 }
+    if !str_eq(dec, "Man") { print("FAIL b64 dec\n"); free(dec); return 2 }
+    free(dec)
+
+    // padding is ignored
+    let p1 = codec_b64_decode("TWE=")
+    if !str_eq(p1, "Ma") { print("FAIL b64 dec pad2\n"); free(p1); return 3 }
+    free(p1)
+
+    let p2 = codec_b64_decode("TQ==")
+    if !str_eq(p2, "M") { print("FAIL b64 dec pad1\n"); free(p2); return 4 }
+    free(p2)
+
+    // whitespace/newlines inside the blob are ignored
+    let wrapped = codec_b64_decode("aGVs bG8g\nd29y bGQ=")
+    if !str_eq(wrapped, "hello world") { print("FAIL b64 wrapped: "); println(wrapped); free(wrapped); return 5 }
+    free(wrapped)
+    return 0
+}
+
+function int test_roundtrips() {
+    // a buffer with every byte value 0..255
+    let buf = mem.make_zero(256)
+    var i = 0
+    while i < 256 {
+        mem.write8(buf + i, i)
+        i++
+    }
+    if !codec_hex_roundtrip(buf, 256) { print("FAIL hex roundtrip 256\n"); free(buf); return 1 }
+    if !codec_b64_roundtrip(buf, 256) { print("FAIL b64 roundtrip 256\n"); free(buf); return 2 }
+
+    // odd lengths exercise every padding case for base64
+    var len = 1
+    while len <= 8 {
+        if !codec_b64_roundtrip(buf, len) { print("FAIL b64 roundtrip len\n"); free(buf); return 3 }
+        if !codec_hex_roundtrip(buf, len) { print("FAIL hex roundtrip len\n"); free(buf); return 4 }
+        len++
+    }
+    free(buf)
+    return 0
+}
+
+function int test_null_safety() {
+    // every entry point tolerates null/zero arguments
+    let e = codec_hex_encode(0 as ptr, 10)
+    if !str_eq(e, "") { print("FAIL hex null\n"); free(e); return 1 }
+    free(e)
+
+    let eb = codec_b64_encode(0 as ptr, 10)
+    if !str_eq(eb, "") { print("FAIL b64 null\n"); free(eb); return 2 }
+    free(eb)
+
+    let d = codec_hex_decode(0 as str)
+    if !str_eq(d, "") { print("FAIL hex dec null\n"); free(d); return 3 }
+    free(d)
+
+    let db = codec_b64_decode(0 as str)
+    if !str_eq(db, "") { print("FAIL b64 dec null\n"); free(db); return 4 }
+    free(db)
+
+    if codec_hex_decode_to_bytes(0 as ptr, "ab") != 0 { print("FAIL hex into null\n"); return 5 }
+    if codec_b64_decode_to_bytes(0 as ptr, "ab") != 0 { print("FAIL b64 into null\n"); return 6 }
+    if codec_hex_encoded_len(0 - 4) != 0 { print("FAIL hex len neg\n"); return 7 }
+    if codec_b64_encoded_len(0 - 4) != 0 { print("FAIL b64 len neg\n"); return 8 }
+
+    let null_ptr: ptr = 0 as ptr
+    if codec_hex_roundtrip(null_ptr, 4) { print("FAIL hex rt null\n"); return 9 }
+    if codec_b64_roundtrip(null_ptr, 4) { print("FAIL b64 rt null\n"); return 10 }
+    return 0
+}
+
+function int test_into_buffer() {
+    // encode into a caller buffer, decode back into another, compare bytes
+    let src = "abcabc"
+    let enc = malloc(codec_b64_encoded_len(6) + 1)
+    let dec = malloc(codec_b64_decoded_len(8) + 1)
+    var rc = 0
+    if enc == 0 || dec == 0 {
+        rc = 1
+    } else {
+        let n = codec_b64_encode_into(enc, src as ptr, 6)
+        if n != 8 {
+            print("FAIL into enc len: ")
+            print_int(n)
+            rc = 2
+        } else {
+            mem.write8(enc + n, 0)
+            let m = codec_b64_decode_to_bytes(dec, enc as str)
+            if m != 6 {
+                print("FAIL into dec len: ")
+                print_int(m)
+                rc = 3
+            } else if memcmp(dec, src as ptr, 6) != 0 {
+                print("FAIL into dec bytes\n")
+                rc = 4
+            }
+        }
+    }
+    if enc != 0 { free(enc) }
+    if dec != 0 { free(dec) }
+    return rc
+}
+
+function int test_decode_block_length() {
+    // binary data starting with a NUL: the _to_bytes API must report the true length
+    let buf = mem.make_zero(4)
+    mem.write8(buf, 0)
+    mem.write8(buf + 1, 0xFF)
+    mem.write8(buf + 2, 0)
+    mem.write8(buf + 3, 0x42)
+
+    let enc = codec_hex_encode(buf, 4)
+    let dst = malloc(codec_hex_decoded_len(string_length(enc)) + 1)
+    var rc = 0
+    if dst == 0 {
+        rc = 1
+    } else {
+        let written = codec_hex_decode_to_bytes(dst, enc)
+        if written != 4 {
+            print("FAIL hex to_bytes len: ")
+            print_int(written)
+            rc = 2
+        } else if memcmp(dst, buf, 4) != 0 {
+            print("FAIL hex to_bytes bytes\n")
+            rc = 3
+        }
+    }
+
+    let encb = codec_b64_encode(buf, 4)
+    let dstb = malloc(codec_b64_decoded_len(string_length(encb)) + 1)
+    if rc == 0 {
+        if dstb == 0 {
+            rc = 4
+        } else {
+            let writtenb = codec_b64_decode_to_bytes(dstb, encb)
+            if writtenb != 4 {
+                print("FAIL b64 to_bytes len: ")
+                print_int(writtenb)
+                rc = 5
+            } else if memcmp(dstb, buf, 4) != 0 {
+                print("FAIL b64 to_bytes bytes\n")
+                rc = 6
+            }
+        }
+    }
+
+    free(enc)
+    if dst != 0 { free(dst) }
+    free(encb)
+    if dstb != 0 { free(dstb) }
+    free(buf)
+    return rc
+}
+
+function int main() {
+    alloc_console()
+
+    let r1 = test_hex_known()
+    if r1 != 0 { return 10 + r1 }
+    let r2 = test_hex_decode()
+    if r2 != 0 { return 20 + r2 }
+    let r3 = test_b64_known()
+    if r3 != 0 { return 30 + r3 }
+    let r4 = test_b64_decode()
+    if r4 != 0 { return 40 + r4 }
+    let r5 = test_roundtrips()
+    if r5 != 0 { return 50 + r5 }
+    let r6 = test_null_safety()
+    if r6 != 0 { return 60 + r6 }
+    let r7 = test_into_buffer()
+    if r7 != 0 { return 70 + r7 }
+    let r8 = test_decode_block_length()
+    if r8 != 0 { return 80 + r8 }
+
+    print("codec: all tests passed\n")
+    return 0
+}

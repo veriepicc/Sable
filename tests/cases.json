@@ -1938,5 +1938,15 @@
       "strbuf: all tests passed\n"
     ],
     "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
+    "Name": "test_codec",
+    "File": "tests/test_codec.sb",
+    "ExpectedExit": 0,
+    "ExpectedRuntimeOutputContains": [
+      "codec: all tests passed\n"
+    ],
+    "RuntimeTimeoutSeconds": 10
   }
 ]

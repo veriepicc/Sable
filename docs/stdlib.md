@@ -34,6 +34,7 @@ import fmt
 | `hash` | hashing and checksums: FNV-1a, djb2, CRC-32, splitmix64 mix, adler32/sum/xor |
 | `bitset` | growable bitset over heap words: get/set/toggle, popcount, find, set algebra |
 | `strbuf` | growable string builder: `strbuf_append`, `strbuf_append_int`, `strbuf_to_string` |
+| `codec` | hex and base64 encode/decode over bytes and strings, with `*_into` variants |
 | `prelude` | convenience bundle importing core modules |
 
 ## `mem`
@@ -312,6 +313,30 @@ function int main() {
 `strbuf_push_byte` add content; `strbuf_view` reads the contents mid-build as a
 null-terminated `str` (no allocation); `strbuf_to_string` materializes a heap
 copy; `strbuf_clear` empties it; `strbuf_reserve` grows ahead of a known volume.
+
+## `codec`
+
+Hex and Base64 codecs over raw bytes, with both encode and decode.
+
+```c
+import codec
+
+function int main() {
+    let hex = codec_hex_encode("Man" as ptr, 3)   // "4d616e"
+    let b64 = codec_b64_encode("Man" as ptr, 3)   // "TWFu"
+    let dec = codec_b64_decode("TWFu")            // "Man"
+    free(hex); free(b64); free(dec)
+    return 0
+}
+```
+
+`codec_hex_encode`/`_upper`/`_decode`, `codec_b64_encode`/`_decode`,
+`codec_b64_encode_str`, plus `*_into` and `*_to_bytes` variants that write into a
+caller buffer and allocate nothing. Decode skips non-alphabet characters (so
+`"4d:61-6e"` and wrapped base64 blobs decode cleanly). For binary data, decode
+with `codec_*_decode_to_bytes` into a buffer sized by `codec_*_decoded_len`, since
+a native-image `str` is NUL-terminated and cannot carry an embedded `0x00`
+length. `codec_hex_roundtrip`/`codec_b64_roundtrip` self-check a buffer.
 
 ## Notes
 
