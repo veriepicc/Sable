@@ -1968,5 +1968,15 @@
       "matrix: all tests passed\n"
     ],
     "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
+    "Name": "test_http_parity",
+    "File": "tests/test_http_parity.sb",
+    "ExpectedExit": 0,
+    "ExpectedRuntimeOutputContains": [
+      "http parity: all tests passed\n"
+    ],
+    "RuntimeTimeoutSeconds": 15
   }
 ]

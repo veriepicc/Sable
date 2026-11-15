@@ -24,6 +24,47 @@ enum HttpWidePartsOffset {
     PathW = 24,
 }
 
+// Per-client configuration. A zeroed config is the default: system proxy,
+// HTTP/1.1, full TLS validation, redirects followed. Strings are borrowed, not
+// owned, and must outlive the request that reads them.
+enum HttpConfigOffset {
+    Proxy = 0,              // str  "host:port", or 0 for the system proxy
+    ProxyBypass = 8,        // str  bypass list or 0
+    UserAgent = 16,         // str  default User-Agent or 0
+    CookieJar = 24,         // ptr  HttpCookieJar or 0
+    TimeoutMs = 32,         // int  connect/send/receive timeout
+    HttpVersion = 40,       // int  HttpVersion
+    Tls = 48,               // int  HttpTlsVerify
+    FollowRedirects = 56,   // int  bool
+    ProxyAuthUser = 64,     // str
+    ProxyAuthPass = 72,     // str
+    EnableCookies = 80,     // int  bool: auto add/absorb cookies
+    StreamSink = 88,        // ptr  HttpSinkFn or 0
+    StreamContext = 96,     // ptr  passed through to the sink
+}
+
+enum HttpConfigSize { ConfigBytes = 104 }
+
+// HTTP protocol preference.
+enum HttpVersion {
+    Auto = 0,
+    Http11 = 1,
+    Http2 = 2,
+}
+
+// Cookie jar: parallel heap arrays of names/values/domain/path/secure flags.
+enum HttpCookieJarOffset {
+    Names = 0,    // ptr array of str
+    Values = 8,   // ptr array of str
+    Domains = 16, // ptr array of str
+    Paths = 24,   // ptr array of str
+    Secure = 32,  // ptr array of int
+    Count = 40,   // int
+    Cap = 48,     // int
+}
+
+enum HttpCookieJarSize { JarBytes = 56 }
+
 view HttpUrl {
     secure: int @ HttpUrlOffset.Secure
     port: int @ HttpUrlOffset.Port
@@ -37,6 +78,32 @@ view HttpResponse {
     raw_headers: str @ HttpResponseOffset.RawHeaders
     body_bytes: ptr @ HttpResponseOffset.BodyBytes
     body_len: int @ HttpResponseOffset.BodyLen
+}
+
+view HttpConfig {
+    proxy: str @ HttpConfigOffset.Proxy
+    proxy_bypass: str @ HttpConfigOffset.ProxyBypass
+    user_agent: str @ HttpConfigOffset.UserAgent
+    cookie_jar: ptr @ HttpConfigOffset.CookieJar
+    timeout_ms: int @ HttpConfigOffset.TimeoutMs
+    http_version: int @ HttpConfigOffset.HttpVersion
+    tls: int @ HttpConfigOffset.Tls
+    follow_redirects: int @ HttpConfigOffset.FollowRedirects
+    proxy_auth_user: str @ HttpConfigOffset.ProxyAuthUser
+    proxy_auth_pass: str @ HttpConfigOffset.ProxyAuthPass
+    enable_cookies: int @ HttpConfigOffset.EnableCookies
+    stream_sink: ptr @ HttpConfigOffset.StreamSink
+    stream_context: ptr @ HttpConfigOffset.StreamContext
+}
+
+view HttpCookieJar {
+    names: ptr @ HttpCookieJarOffset.Names
+    values: ptr @ HttpCookieJarOffset.Values
+    domains: ptr @ HttpCookieJarOffset.Domains
+    paths: ptr @ HttpCookieJarOffset.Paths
+    secure: ptr @ HttpCookieJarOffset.Secure
+    count: int @ HttpCookieJarOffset.Count
+    cap: int @ HttpCookieJarOffset.Cap
 }
 
 view HttpWideParts {
@@ -58,6 +125,75 @@ using WinHttpReadDataFn = fn(ptr, ptr, int, ptr) -> int
 using WinHttpCloseHandleFn = fn(ptr) -> int
 using WinHttpAddRequestHeadersFn = fn(ptr, ptr, int, int) -> int
 using WinHttpSetOptionFn = fn(ptr, int, ptr, int) -> int
+using WinHttpWriteDataFn = fn(ptr, ptr, int, ptr) -> int
+using WinHttpSetCredentialsFn = fn(ptr, int, int, ptr, ptr, ptr) -> int
+using WinHttpQueryAuthSchemesFn = fn(ptr, ptr, ptr, ptr) -> int
+
+// Callback for streaming bodies. Invoked with a caller-supplied context, the
+// next chunk of body bytes, and its length; return 0 to abort the transfer,
+// non-zero to continue. Mirrors libcurl's write callback userdata argument.
+using HttpSinkFn = fn(ptr, ptr, int) -> int
+
+// WinHTTP option numbers (winhttp.h). Set with WinHttpSetOption.
+enum HttpOption {
+    ConnectTimeout = 3,
+    SendTimeout = 4,
+    ReceiveTimeout = 5,
+    Proxy = 38,
+    SecureProtocols = 84,
+    RedirectPolicy = 88,
+    EnableHttpProtocol = 133,
+    DisableFeature = 109,
+}
+
+// WINHTTP_OPTION_DISABLE_FEATURE bits.
+enum HttpDisableFeature { Http2OverTcp = 1024 }
+
+// WINHTTP_OPTION_ENABLE_HTTP_PROTOCOL / WINHTTP_PROTOCOL_FLAG_* values.
+enum HttpProtocolFlag {
+    Http2 = 1,
+    Http3 = 2,
+}
+
+// WINHTTP_OPTION_SECURE_PROTOCOLS bits (winhttp.h).
+enum HttpSecureProtocol {
+    Ssl2 = 4,
+    Ssl3 = 8,
+    Tls10 = 16,
+    Tls11 = 32,
+    Tls12 = 2048,
+    Tls13 = 8192,
+}
+
+// WINHTTP_OPTION_REDIRECT_POLICY values.
+enum HttpRedirectPolicy {
+    Never = 0,
+    DisallowHttpsToHttp = 1,
+    Always = 2,
+}
+
+// WINHTTP_OPTION_PROXY dwAccessType values.
+enum HttpProxyAccess {
+    Direct = 1,
+    NamedProxy = 3,
+    DefaultProxy = 5,
+}
+
+// TLS verification levels for http_config_set_tls (mirrors CURLOPT_SSL_VERIFYPEER
+// plus WINHTTP_OPTION_SECURITY_FLAGS). VerifyDefault keeps WinHTTP's normal
+// chain + hostname validation.
+enum HttpTlsVerify {
+    VerifyDefault = 0,   // full validation (default)
+    IgnoreCertCnFailure = 1,   // WINHTTP_FLAG_SECURITY_IGNORE_CERT_CN_INVALID
+    IgnoreCertDateFailure = 2, // WINHTTP_FLAG_SECURITY_IGNORE_CERT_DATE_INVALID
+    IgnoreAll = 3,       // both of the above (CURLOPT_SSL_VERIFYPEER=0-ish)
+}
+
+// WINHTTP_OPTION_SECURITY_FLAGS bits used by HttpTlsVerify.
+enum HttpSecurityFlag {
+    CertCnInvalid = 4096,
+    CertDateInvalid = 8192,
+}
 
 function str http_empty_text() {
     return string_substring("", 0, 0)
@@ -287,6 +423,63 @@ function int http_rfind_char(str text_value, int ch) {
         i--
     }
     return -1
+}
+
+// Lowercase copy of a string. Heap string (caller frees).
+function str http_lower_copy(str text_value) {
+    if text_value == 0 {
+        return http_empty_text()
+    }
+    let len = string_length(text_value)
+    let out = mem.make_zero(len + 1)
+    if out == 0 {
+        return http_empty_text()
+    }
+    let p = text_value as ptr
+    var i = 0
+    while i < len {
+        mem.write8(out + i, http_ascii_lower(mem.read8(p + i)))
+        i++
+    }
+    mem.write8(out + len, 0)
+    let result = make_string(out)
+    free(out)
+    return result
+}
+
+function bool http_starts_with(str text_value, str prefix) {
+    if text_value == 0 or prefix == 0 {
+        return false
+    }
+    let plen = string_length(prefix)
+    if plen == 0 {
+        return true
+    }
+    if string_length(text_value) < plen {
+        return false
+    }
+    return memcmp(text_value as ptr, prefix as ptr, plen) == 0
+}
+
+// Trim leading and trailing spaces/tabs. Heap string (caller frees).
+function str http_trim(str text_value) {
+    if text_value == 0 {
+        return http_empty_text()
+    }
+    let len = string_length(text_value)
+    let p = text_value as ptr
+    var start = 0
+    while start < len and (mem.read8(p + start) == 32 or mem.read8(p + start) == 9) {
+        start++
+    }
+    var stop = len
+    while stop > start and (mem.read8(p + stop - 1) == 32 or mem.read8(p + stop - 1) == 9) {
+        stop--
+    }
+    if stop <= start {
+        return http_empty_text()
+    }
+    return string_substring(text_value, start, stop - start)
 }
 
 function HttpUrl http_url_new() {
@@ -624,6 +817,506 @@ function void http_close_if(ptr close_fn, ptr handle_value) {
     }
 }
 
+// ============================================================================
+// Client configuration (proxy, TLS, HTTP/2, timeouts, cookies, streaming)
+// ============================================================================
+
+function HttpConfig http_config_new() {
+    let cfg = mem.make_zero(HttpConfigSize.ConfigBytes) as HttpConfig
+    if cfg == 0 {
+        return 0 as HttpConfig
+    }
+    cfg.proxy = 0 as str
+    cfg.proxy_bypass = 0 as str
+    cfg.user_agent = 0 as str
+    cfg.cookie_jar = 0
+    cfg.timeout_ms = 30000
+    cfg.http_version = HttpVersion.Auto
+    cfg.tls = HttpTlsVerify.VerifyDefault
+    cfg.follow_redirects = 1
+    cfg.proxy_auth_user = 0 as str
+    cfg.proxy_auth_pass = 0 as str
+    cfg.enable_cookies = 0
+    cfg.stream_sink = 0
+    cfg.stream_context = 0
+    return cfg
+}
+
+// Config strings are borrowed, so freeing a config only releases the struct.
+function void http_config_free(HttpConfig cfg) {
+    if cfg == 0 {
+        return
+    }
+    free(cfg)
+}
+
+function void http_config_set_proxy(HttpConfig cfg, str proxy, str bypass) {
+    if cfg == 0 {
+        return
+    }
+    cfg.proxy = proxy
+    cfg.proxy_bypass = bypass
+}
+
+function void http_config_set_proxy_auth(HttpConfig cfg, str user, str pass) {
+    if cfg == 0 {
+        return
+    }
+    cfg.proxy_auth_user = user
+    cfg.proxy_auth_pass = pass
+}
+
+function void http_config_set_tls(HttpConfig cfg, int verify_level) {
+    if cfg == 0 {
+        return
+    }
+    cfg.tls = verify_level
+}
+
+function void http_config_set_http_version(HttpConfig cfg, int version) {
+    if cfg == 0 {
+        return
+    }
+    cfg.http_version = version
+}
+
+function void http_config_set_timeout(HttpConfig cfg, int ms) {
+    if cfg == 0 {
+        return
+    }
+    cfg.timeout_ms = ms
+}
+
+function void http_config_set_user_agent(HttpConfig cfg, str agent) {
+    if cfg == 0 {
+        return
+    }
+    cfg.user_agent = agent
+}
+
+function void http_config_set_follow_redirects(HttpConfig cfg, bool follow) {
+    if cfg == 0 {
+        return
+    }
+    if follow {
+        cfg.follow_redirects = 1
+    } else {
+        cfg.follow_redirects = 0
+    }
+}
+
+function void http_config_set_cookie_jar(HttpConfig cfg, HttpCookieJar jar) {
+    if cfg == 0 {
+        return
+    }
+    cfg.cookie_jar = jar
+    cfg.enable_cookies = 1
+}
+
+// Attach a streaming sink. The sink receives each body chunk as it arrives and
+// the response body is left empty (bytes go to the sink instead of memory).
+// `context` is an opaque pointer handed to every sink call (curl userdata).
+function void http_config_set_sink(HttpConfig cfg, HttpSinkFn sink) {
+    if cfg == 0 {
+        return
+    }
+    cfg.stream_sink = sink
+}
+
+function void http_config_set_sink_ctx(HttpConfig cfg, HttpSinkFn sink, ptr context) {
+    if cfg == 0 {
+        return
+    }
+    cfg.stream_sink = sink
+    cfg.stream_context = context
+}
+
+// Apply the config to a session/request pair. set_option_fn may be 0, in which
+// case the option calls are skipped. Returns true when every attempted option
+// call succeeded (a call can legitimately fail on older Windows for options it
+// does not know).
+function bool http_apply_config_to_session(HttpConfig cfg, ptr session, ptr set_option_fn) {
+    if cfg == 0 or session == 0 or set_option_fn == 0 {
+        return true
+    }
+    let set_fn = set_option_fn as WinHttpSetOptionFn
+    let scratch = mem.make_zero(4)
+    if scratch == 0 {
+        return false
+    }
+    var all_ok = true
+
+    // TLS protocol floor: disable SSL2/SSL3, allow TLS 1.0-1.3.
+    mem.write32(scratch, HttpSecureProtocol.Tls10 + HttpSecureProtocol.Tls11 + HttpSecureProtocol.Tls12 + HttpSecureProtocol.Tls13)
+    if set_fn(session, HttpOption.SecureProtocols, scratch, 4) == 0 {
+        all_ok = false
+    }
+
+    // Proxy: WINHTTP_PROXY_INFO { dwAccessType, lpszProxy, lpszProxyBypass }
+    if cfg.proxy != 0 and string_length(cfg.proxy) > 0 {
+        let info = mem.make_zero(24)
+        if info == 0 {
+            free(scratch)
+            return false
+        }
+        mem.write32(info, HttpProxyAccess.NamedProxy)
+        mem.write64(info + 8, http_utf16z(cfg.proxy) as int)
+        if cfg.proxy_bypass != 0 and string_length(cfg.proxy_bypass) > 0 {
+            mem.write64(info + 16, http_utf16z(cfg.proxy_bypass) as int)
+        }
+        if set_fn(session, HttpOption.Proxy, info, 24) == 0 {
+            all_ok = false
+        }
+        let p1 = mem.read64(info + 8)
+        let p2 = mem.read64(info + 16)
+        if p1 != 0 { free(p1 as ptr) }
+        if p2 != 0 { free(p2 as ptr) }
+        free(info)
+    }
+
+    free(scratch)
+    return all_ok
+}
+
+function bool http_apply_config_to_request(HttpConfig cfg, ptr request, ptr set_option_fn) {
+    if cfg == 0 or request == 0 {
+        return true
+    }
+    var all_ok = true
+
+    if set_option_fn != 0 {
+        let set_fn = set_option_fn as WinHttpSetOptionFn
+
+        // Redirect policy (option 88): 0 = never, 2 = always.
+        let policy = mem.make_zero(4)
+        if policy != 0 {
+            if cfg.follow_redirects != 0 {
+                mem.write32(policy, HttpRedirectPolicy.Always)
+            } else {
+                mem.write32(policy, HttpRedirectPolicy.Never)
+            }
+            if set_fn(request, HttpOption.RedirectPolicy, policy, 4) == 0 {
+                all_ok = false
+            }
+            free(policy)
+        }
+
+        // HTTP/2 opt-in (option 133). Per MSDN this must be set on the request
+        // handle after WinHttpOpenRequest and before WinHttpSendRequest.
+        if cfg.http_version == HttpVersion.Http2 {
+            let proto = mem.make_zero(4)
+            if proto != 0 {
+                mem.write32(proto, HttpProtocolFlag.Http2)
+                if set_fn(request, HttpOption.EnableHttpProtocol, proto, 4) == 0 {
+                    all_ok = false
+                }
+                free(proto)
+            }
+        } else if cfg.http_version == HttpVersion.Http11 {
+            // explicitly forbid h2-over-tcp so the request stays on HTTP/1.1
+            let dis = mem.make_zero(4)
+            if dis != 0 {
+                mem.write32(dis, HttpDisableFeature.Http2OverTcp)
+                if set_fn(request, HttpOption.DisableFeature, dis, 4) == 0 {
+                    all_ok = false
+                }
+                free(dis)
+            }
+        }
+
+        // TLS verification relaxation (option 31, WINHTTP_OPTION_SECURITY_FLAGS).
+        if cfg.tls != HttpTlsVerify.VerifyDefault {
+            var flags = 0
+            if cfg.tls == HttpTlsVerify.IgnoreCertCnFailure or cfg.tls == HttpTlsVerify.IgnoreAll {
+                flags = flags + HttpSecurityFlag.CertCnInvalid
+            }
+            if cfg.tls == HttpTlsVerify.IgnoreCertDateFailure or cfg.tls == HttpTlsVerify.IgnoreAll {
+                flags = flags + HttpSecurityFlag.CertDateInvalid
+            }
+            let sec = mem.make_zero(4)
+            if sec != 0 {
+                mem.write32(sec, flags)
+                if set_fn(request, 31, sec, 4) == 0 {
+                    all_ok = false
+                }
+                free(sec)
+            }
+        }
+    }
+    return all_ok
+}
+
+// ============================================================================
+// Cookie jar
+// ============================================================================
+
+function HttpCookieJar http_cookie_jar_new() {
+    let jar = mem.make_zero(HttpCookieJarSize.JarBytes) as HttpCookieJar
+    if jar == 0 {
+        return 0 as HttpCookieJar
+    }
+    jar.cap = 8
+    jar.count = 0
+    jar.names = mem.make_zero(jar.cap * 8)
+    jar.values = mem.make_zero(jar.cap * 8)
+    jar.domains = mem.make_zero(jar.cap * 8)
+    jar.paths = mem.make_zero(jar.cap * 8)
+    jar.secure = mem.make_zero(jar.cap * 8)
+    if jar.names == 0 or jar.values == 0 or jar.domains == 0 or jar.paths == 0 or jar.secure == 0 {
+        http_cookie_jar_free(jar)
+        return 0 as HttpCookieJar
+    }
+    return jar
+}
+
+function void http_cookie_jar_free(HttpCookieJar jar) {
+    if jar == 0 {
+        return
+    }
+    var i = 0
+    while i < jar.count {
+        let nm = mem.read(jar.names + i * 8) as str
+        let vl = mem.read(jar.values + i * 8) as str
+        let dm = mem.read(jar.domains + i * 8) as str
+        let pt = mem.read(jar.paths + i * 8) as str
+        if nm != 0 { free(nm) }
+        if vl != 0 { free(vl) }
+        if dm != 0 { free(dm) }
+        if pt != 0 { free(pt) }
+        i++
+    }
+    if jar.names != 0 { free(jar.names) }
+    if jar.values != 0 { free(jar.values) }
+    if jar.domains != 0 { free(jar.domains) }
+    if jar.paths != 0 { free(jar.paths) }
+    if jar.secure != 0 { free(jar.secure) }
+    free(jar)
+}
+
+// Grow the parallel arrays to hold one more cookie. Keeps the layout invariant:
+// all five arrays always have `cap` slots.
+function bool http_cookie_grow(HttpCookieJar jar) {
+    if jar.count < jar.cap {
+        return true
+    }
+    let new_cap = jar.cap * 2
+    let nn = mem.make_zero(new_cap * 8)
+    let nv = mem.make_zero(new_cap * 8)
+    let nd = mem.make_zero(new_cap * 8)
+    let np = mem.make_zero(new_cap * 8)
+    let ns = mem.make_zero(new_cap * 8)
+    if nn == 0 or nv == 0 or nd == 0 or np == 0 or ns == 0 {
+        if nn != 0 { free(nn) }
+        if nv != 0 { free(nv) }
+        if nd != 0 { free(nd) }
+        if np != 0 { free(np) }
+        if ns != 0 { free(ns) }
+        return false
+    }
+    if jar.count > 0 {
+        memcpy(nn, jar.names, jar.count * 8)
+        memcpy(nv, jar.values, jar.count * 8)
+        memcpy(nd, jar.domains, jar.count * 8)
+        memcpy(np, jar.paths, jar.count * 8)
+        memcpy(ns, jar.secure, jar.count * 8)
+    }
+    free(jar.names)  free(jar.values)  free(jar.domains)  free(jar.paths)  free(jar.secure)
+    jar.names = nn  jar.values = nv  jar.domains = nd  jar.paths = np  jar.secure = ns
+    jar.cap = new_cap
+    return true
+}
+
+// Replace any existing cookie with the same name+domain+path, else append.
+function void http_cookie_set(HttpCookieJar jar, str domain, str path, str name, str value, bool secure) {
+    if jar == 0 or name == 0 or string_length(name) == 0 {
+        return
+    }
+    var i = 0
+    while i < jar.count {
+        let nm = mem.read(jar.names + i * 8) as str
+        let dm = mem.read(jar.domains + i * 8) as str
+        let pt = mem.read(jar.paths + i * 8) as str
+        if http_eq(nm, name) and http_eq(dm, domain) and http_eq(pt, path) {
+            let old = mem.read(jar.values + i * 8) as str
+            if old != 0 { free(old) }
+            mem.write(jar.values + i * 8, http_dup(value) as int)
+            return
+        }
+        i++
+    }
+    if !http_cookie_grow(jar) {
+        return
+    }
+    let idx = jar.count
+    mem.write(jar.names + idx * 8, http_dup(name) as int)
+    mem.write(jar.values + idx * 8, http_dup(value) as int)
+    mem.write(jar.domains + idx * 8, http_dup(domain) as int)
+    mem.write(jar.paths + idx * 8, http_dup(path) as int)
+    mem.write(jar.secure + idx * 8, secure as int)
+    jar.count = idx + 1
+}
+
+function str http_cookie_get(HttpCookieJar jar, str domain, str name) {
+    if jar == 0 or name == 0 {
+        return 0 as str
+    }
+    var i = 0
+    while i < jar.count {
+        let nm = mem.read(jar.names + i * 8) as str
+        let dm = mem.read(jar.domains + i * 8) as str
+        if http_eq(nm, name) and http_eq(dm, domain) {
+            let vl = mem.read(jar.values + i * 8) as str
+            if vl != 0 {
+                return http_dup(vl)
+            }
+        }
+        i++
+    }
+    return 0 as str
+}
+
+// Build a "Cookie: n1=v1; n2=v2" header value for `domain`. Heap string
+// (caller frees) or 0 when the jar has nothing for that host.
+function str http_cookie_header_for(HttpCookieJar jar, str domain) {
+    if jar == 0 or domain == 0 or jar.count == 0 {
+        return 0 as str
+    }
+    var out = http_empty_text()
+    var matched = 0
+    var i = 0
+    while i < jar.count {
+        let nm = mem.read(jar.names + i * 8) as str
+        let dm = mem.read(jar.domains + i * 8) as str
+        let vl = mem.read(jar.values + i * 8) as str
+        if http_eq(dm, domain) and nm != 0 {
+            var piece = http_join2(nm, "=")
+            let with_val = http_join2(piece, vl)
+            free(piece)
+            var next = ""
+            if matched > 0 {
+                next = http_join2(out, "; ")
+                free(out)
+            } else {
+                next = out
+            }
+            let final = http_join2(next, with_val)
+            free(next)
+            free(with_val)
+            out = final
+            matched++
+        }
+        i++
+    }
+    if matched == 0 {
+        free(out)
+        return 0 as str
+    }
+    return out
+}
+
+// Parse one "Set-Cookie: name=value; Path=/; Domain=...; Secure; ..." line into
+// the jar. `default_domain` is the request host, used when the cookie omits
+// Domain. Returns true when a cookie was stored.
+function bool http_cookie_absorb_line(HttpCookieJar jar, str default_domain, str line) {
+    if jar == 0 or line == 0 {
+        return false
+    }
+    let eq = http_find(line, "=")
+    if eq <= 0 {
+        return false
+    }
+    let name = string_substring(line, 0, eq)
+    // value runs to the first ';' or end
+    let semi = http_find(line, ";")
+    var value = 0 as str
+    if semi > eq {
+        value = string_substring(line, eq + 1, semi - eq - 1)
+    } else {
+        value = string_substring(line, eq + 1, string_length(line) - eq - 1)
+    }
+
+    var domain = http_dup(default_domain)
+    var path = http_clone("/")
+    var secure = false
+
+    // scan the attribute list
+    var rest = semi
+    while rest > 0 and rest < string_length(line) {
+        var attr_start = rest + 1
+        // skip spaces
+        while attr_start < string_length(line) and mem.read8((line as ptr) + attr_start) == 32 {
+            attr_start++
+        }
+        var attr_end = attr_start
+        while attr_end < string_length(line) and mem.read8((line as ptr) + attr_end) != 59 {
+            attr_end++
+        }
+        let attr = string_substring(line, attr_start, attr_end - attr_start)
+        let alot_lower = http_lower_copy(attr)
+        if http_starts_with(alot_lower, "domain=") {
+            free(domain)
+            domain = string_substring(attr, 7, string_length(attr) - 7)
+        } else if http_starts_with(alot_lower, "path=") {
+            free(path)
+            path = string_substring(attr, 5, string_length(attr) - 5)
+        } else if http_starts_with(alot_lower, "secure") {
+            secure = true
+        }
+        free(alot_lower)
+        free(attr)
+        rest = attr_end
+    }
+
+    http_cookie_set(jar, domain, path, name, value, secure)
+    free(name)  free(value)  free(domain)  free(path)
+    return true
+}
+
+// Pull every Set-Cookie line out of a raw response header block and absorb the
+// name=value pairs into the jar (domain defaults to `host`).
+function int http_cookie_absorb_headers(HttpCookieJar jar, str host, str raw_headers) {
+    if jar == 0 or raw_headers == 0 {
+        return 0
+    }
+    var absorbed = 0
+    let len = string_length(raw_headers)
+    let bp = raw_headers as ptr
+    var line_start = 0
+    while line_start < len {
+        var line_end = line_start
+        while line_end < len and mem.read8(bp + line_end) != 13 {
+            line_end++
+        }
+        let line_len = line_end - line_start
+        if line_len > 12 {
+            let prefix = string_substring(raw_headers, line_start, 11)
+            let lower = http_lower_copy(prefix)
+            if http_eq(lower, "set-cookie:") {
+                let value = string_substring(raw_headers, line_start + 11, line_len - 11)
+                let trimmed = http_trim(value)
+                free(value)
+                if http_cookie_absorb_line(jar, host, trimmed) {
+                    absorbed++
+                }
+                free(trimmed)
+            }
+            free(prefix)
+            free(lower)
+        }
+        line_start = line_end
+        if line_start < len and mem.read8(bp + line_start) == 13 { line_start++ }
+        if line_start < len and mem.read8(bp + line_start) == 10 { line_start++ }
+    }
+    return absorbed
+}
+
+function int http_cookie_count(HttpCookieJar jar) {
+    if jar == 0 {
+        return 0
+    }
+    return jar.count
+}
+
 function int http_query_status(ptr request_handle, ptr query_headers) {
     let status_ptr = mem.make_zero(8)
     let size_ptr = mem.make_zero(8)
@@ -721,6 +1414,71 @@ function ptr http_read_body_bytes(ptr request_handle, ptr query_data_available, 
     mem.write8(buf + total_len, 0)
     mem.write(len_out, total_len)
     return buf
+}
+
+// Stream the response body through `sink` in chunks. Returns the total byte
+// count delivered, or -1 on a transfer error. Nothing is buffered in memory
+// beyond the read chunk, so this is safe for arbitrarily large bodies.
+function int http_stream_body(ptr request_handle, ptr query_data_available, ptr read_data, HttpSinkFn sink, ptr context) {
+    if sink == 0 {
+        return -1
+    }
+    let available_ptr = mem.make_zero(8)
+    let read_count_ptr = mem.make_zero(8)
+    if available_ptr == 0 or read_count_ptr == 0 {
+        if available_ptr != 0 { free(available_ptr) }
+        if read_count_ptr != 0 { free(read_count_ptr) }
+        return -1
+    }
+    let chunk = malloc(65536)
+    if chunk == 0 {
+        free(available_ptr)
+        free(read_count_ptr)
+        return -1
+    }
+
+    let query_avail_fn = query_data_available as WinHttpQueryDataAvailableFn
+    let read_data_fn = read_data as WinHttpReadDataFn
+    var total = 0
+    var failed = false
+
+    while true {
+        mem.write32(available_ptr, 0)
+        if query_avail_fn(request_handle, available_ptr) == 0 {
+            failed = true
+            break
+        }
+        let available = mem.read32(available_ptr)
+        if available <= 0 {
+            break
+        }
+        var want = available
+        if want > 65536 {
+            want = 65536
+        }
+        mem.write32(read_count_ptr, 0)
+        if read_data_fn(request_handle, chunk, want, read_count_ptr) == 0 {
+            failed = true
+            break
+        }
+        let got = mem.read32(read_count_ptr)
+        if got <= 0 {
+            break
+        }
+        if sink(context, chunk, got) == 0 {
+            failed = true
+            break
+        }
+        total = total + got
+    }
+
+    free(chunk)
+    free(available_ptr)
+    free(read_count_ptr)
+    if failed {
+        return -1
+    }
+    return total
 }
 
 function str http_read_body(ptr request_handle, ptr query_data_available, ptr read_data) {
@@ -892,14 +1650,15 @@ enum HttpRequestOffset {
     HeaderLen = 24,       // int
     HeaderCap = 32,       // int
     Body = 40,            // ptr raw bytes
-    BodyLen = 48,         // int
+    BodyLen = 48,          // int
     ContentType = 56,     // str
     UserAgent = 64,       // str
     TimeoutMs = 72,       // int
     FollowRedirects = 80, // int (bool)
+    Config = 88,          // ptr HttpConfig or 0 (borrowed)
 }
 
-enum HttpRequestSize { RequestBytes = 88 }
+enum HttpRequestSize { RequestBytes = 96 }
 
 view HttpRequest {
     method: str @ HttpRequestOffset.Method
@@ -913,6 +1672,7 @@ view HttpRequest {
     user_agent: str @ HttpRequestOffset.UserAgent
     timeout_ms: int @ HttpRequestOffset.TimeoutMs
     follow_redirects: int @ HttpRequestOffset.FollowRedirects
+    config: ptr @ HttpRequestOffset.Config
 }
 
 function str http_dup(str text_value) {
@@ -979,6 +1739,7 @@ function HttpRequest http_request_new(str method, str url) {
     req.user_agent = 0 as str
     req.timeout_ms = 30000
     req.follow_redirects = 1
+    req.config = 0
     if req.header_buf != 0 {
         mem.write8(req.header_buf, 0)
     }
@@ -1062,6 +1823,15 @@ function void http_request_follow_redirects(HttpRequest req, bool follow) {
     } else {
         req.follow_redirects = 0
     }
+}
+
+// Attach a client config (proxy, TLS, HTTP/2, cookies, streaming). Borrowed, not
+// owned: the config must outlive the request. Passing 0 restores defaults.
+function void http_request_set_config(HttpRequest req, HttpConfig cfg) {
+    if req == 0 {
+        return
+    }
+    req.config = cfg
 }
 
 function void http_request_free(HttpRequest req) {
@@ -1205,19 +1975,30 @@ function HttpResponse http_request_send(HttpRequest req) {
         winhttp_set_timeouts(session, req.timeout_ms, req.timeout_ms, req.timeout_ms, req.timeout_ms)
     }
 
-    // WINHTTP_OPTION_REDIRECT_POLICY = 88; values: 0 = never,
-    // 1 = disallow https->http, 2 = always follow. Default is 2.
-    if set_option_fn != 0 {
-        let policy = mem.make_zero(4)
-        if policy != 0 {
-            if req.follow_redirects != 0 {
-                mem.write32(policy, 2)
-            } else {
-                mem.write32(policy, 0)
+    // client config: TLS floor, proxy, and (below, per-request) redirect policy,
+    // HTTP/2 opt-in and TLS verification relaxation.
+    let cfg = req.config as HttpConfig
+    if cfg != 0 {
+        if cfg.timeout_ms > 0 {
+            let winhttp_set_timeouts = set_timeouts_fn as WinHttpSetTimeoutsFn
+            winhttp_set_timeouts(session, cfg.timeout_ms, cfg.timeout_ms, cfg.timeout_ms, cfg.timeout_ms)
+        }
+        http_apply_config_to_session(cfg, session, set_option_fn)
+    } else {
+        // WINHTTP_OPTION_REDIRECT_POLICY = 88; values: 0 = never,
+        // 1 = disallow https->http, 2 = always follow. Default is 2.
+        if set_option_fn != 0 {
+            let policy = mem.make_zero(4)
+            if policy != 0 {
+                if req.follow_redirects != 0 {
+                    mem.write32(policy, 2)
+                } else {
+                    mem.write32(policy, 0)
+                }
+                let winhttp_set_option = set_option_fn as WinHttpSetOptionFn
+                winhttp_set_option(session, 88, policy, 4)
+                free(policy)
             }
-            let winhttp_set_option = set_option_fn as WinHttpSetOptionFn
-            winhttp_set_option(session, 88, policy, 4)
-            free(policy)
         }
     }
 
@@ -1241,13 +2022,32 @@ function HttpResponse http_request_send(HttpRequest req) {
     let request = winhttp_open_req(connection, method_w, path_w, 0, 0, 0, request_flags)
     free(method_w)
     free(path_w)
-    http_url_free(parsed)
 
     if request == 0 {
+        http_url_free(parsed)
         http_close_if(close_handle_fn, connection)
         http_close_if(close_handle_fn, session)
         return http_fail_response()
     }
+
+    // per-request config: redirect policy, HTTP/2 opt-in, TLS verification
+    if cfg != 0 {
+        http_apply_config_to_request(cfg, request, set_option_fn)
+    }
+
+    // inject cookies for this host, when a jar is attached
+    var cookie_hdr = 0 as str
+    if cfg != 0 and cfg.enable_cookies != 0 and cfg.cookie_jar != 0 {
+        cookie_hdr = http_cookie_header_for(cfg.cookie_jar as HttpCookieJar, parsed.host)
+        if cookie_hdr != 0 and string_length(cookie_hdr) > 0 {
+            http_request_header(req, "Cookie", cookie_hdr)
+        }
+        if cookie_hdr != 0 {
+            free(cookie_hdr)
+        }
+    }
+
+    http_url_free(parsed)
 
     // Build the full wide (UTF-16) header block: accumulated headers plus a
     // Content-Type line when a body type was set. WinHttpSendRequest takes this
@@ -1300,6 +2100,30 @@ function HttpResponse http_request_send(HttpRequest req) {
 
     let status = http_query_status(request, query_headers_fn)
     let raw_headers = http_query_raw_headers(request, query_headers_fn)
+
+    // absorb any Set-Cookie lines into the attached jar
+    if cfg != 0 and cfg.enable_cookies != 0 and cfg.cookie_jar != 0 and raw_headers != 0 {
+        let host_parsed = http_parse_url(req.url)
+        if host_parsed != 0 {
+            http_cookie_absorb_headers(cfg.cookie_jar as HttpCookieJar, host_parsed.host, raw_headers)
+            http_url_free(host_parsed)
+        }
+    }
+
+    // streaming: hand the body to the sink and keep nothing in memory
+    if cfg != 0 and cfg.stream_sink != 0 {
+        let sink = cfg.stream_sink as HttpSinkFn
+        let streamed = http_stream_body(request, query_data_available_fn, read_data_fn, sink, cfg.stream_context)
+        http_close_if(close_handle_fn, request)
+        http_close_if(close_handle_fn, connection)
+        http_close_if(close_handle_fn, session)
+        if streamed < 0 {
+            let failed = http_response_new_full(status, http_empty_text(), raw_headers)
+            return failed
+        }
+        return http_response_new_full(status, http_empty_text(), raw_headers)
+    }
+
     let body_len_ptr = mem.make_zero(8)
     var body_bytes = 0
     var body_len = 0

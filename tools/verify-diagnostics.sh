@@ -88,6 +88,24 @@ for m in hash bitset strbuf codec math matrix; do
 done
 
 echo
+echo "== http module (zero ERRORS; the 'possible leak' warnings are pre-existing"
+echo "   false positives across the module and are not gated) =="
+for m in http_client http_parity; do
+    wine "$SABLE" --fast -Wall "tests/test_$m.sb" >"$tmp/$m.out" 2>&1
+    rc=$?
+    n=$({ grep -c "error" "$tmp/$m.out" || true; })
+    if [ "$rc" -eq 0 ] && [ "$n" -eq 0 ]; then
+        echo "  ok   test_$m.sb: exit 0, 0 errors"
+        pass=$((pass+1))
+    else
+        echo "  FAIL test_$m.sb: exit=$rc errors=$n"
+        fail=$((fail+1))
+    fi
+    timeout 30 wine "tests/test_$m.exe" >"$tmp/$m.run" 2>/dev/null
+    echo "       run: $(head -1 "$tmp/$m.run")"
+done
+
+echo
 echo "== total warning kinds registered =="
 wine "$SABLE" -Wlist 2>&1 | sed 's/\x1b\[[0-9;]*m//g' | grep -c '^  -W' | sed 's/^/  /'
 

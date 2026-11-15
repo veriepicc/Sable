@@ -1,0 +1,296 @@
+import http
+import text
+import mem
+
+// Offline coverage for the libcurl-parity layer of the http module: client
+// config (proxy/TLS/HTTP-version/timeouts), the cookie jar, streaming sinks,
+// and Set-Cookie parsing. No network required.
+
+fn test_config_defaults() -> int {
+    let cfg = http_config_new()
+    if cfg == 0 { return 1 }
+    if cfg.timeout_ms != 30000 { http_config_free(cfg); return 2 }
+    if cfg.http_version != HttpVersion.Auto { http_config_free(cfg); return 3 }
+    if cfg.tls != HttpTlsVerify.VerifyDefault { http_config_free(cfg); return 4 }
+    if cfg.follow_redirects != 1 { http_config_free(cfg); return 5 }
+    if cfg.enable_cookies != 0 { http_config_free(cfg); return 6 }
+    if cfg.proxy != 0 { http_config_free(cfg); return 7 }
+    http_config_free(cfg)
+    return 0
+}
+
+fn test_config_setters() -> int {
+    let cfg = http_config_new()
+    if cfg == 0 { return 1 }
+
+    http_config_set_proxy(cfg, "proxy.local:3128", "localhost,127.0.0.1")
+    if !text_eq(cfg.proxy, "proxy.local:3128") { http_config_free(cfg); return 2 }
+    if !text_eq(cfg.proxy_bypass, "localhost,127.0.0.1") { http_config_free(cfg); return 3 }
+
+    http_config_set_proxy_auth(cfg, "puser", "ppass")
+    if !text_eq(cfg.proxy_auth_user, "puser") { http_config_free(cfg); return 4 }
+
+    http_config_set_tls(cfg, HttpTlsVerify.IgnoreCertDateFailure)
+    if cfg.tls != HttpTlsVerify.IgnoreCertDateFailure { http_config_free(cfg); return 5 }
+
+    http_config_set_http_version(cfg, HttpVersion.Http2)
+    if cfg.http_version != HttpVersion.Http2 { http_config_free(cfg); return 6 }
+
+    http_config_set_timeout(cfg, 1234)
+    if cfg.timeout_ms != 1234 { http_config_free(cfg); return 7 }
+
+    http_config_set_user_agent(cfg, "SableTest/9")
+    if !text_eq(cfg.user_agent, "SableTest/9") { http_config_free(cfg); return 8 }
+
+    http_config_set_follow_redirects(cfg, false)
+    if cfg.follow_redirects != 0 { http_config_free(cfg); return 9 }
+    http_config_set_follow_redirects(cfg, true)
+    if cfg.follow_redirects != 1 { http_config_free(cfg); return 10 }
+
+    http_config_free(cfg)
+    return 0
+}
+
+fn test_cookie_jar_basic() -> int {
+    let jar = http_cookie_jar_new()
+    if jar == 0 { return 1 }
+    if http_cookie_count(jar) != 0 { http_cookie_jar_free(jar); return 2 }
+
+    http_cookie_set(jar, "example.com", "/", "session", "abc123", false)
+    http_cookie_set(jar, "example.com", "/", "theme", "dark", false)
+    if http_cookie_count(jar) != 2 { http_cookie_jar_free(jar); return 3 }
+
+    let s = http_cookie_get(jar, "example.com", "session")
+    if !text_eq(s, "abc123") { free(s); http_cookie_jar_free(jar); return 4 }
+    free(s)
+
+    // a missing cookie returns null
+    if http_cookie_get(jar, "example.com", "nope") != 0 { http_cookie_jar_free(jar); return 5 }
+
+    // a different host must not see it
+    if http_cookie_get(jar, "other.com", "session") != 0 { http_cookie_jar_free(jar); return 6 }
+
+    http_cookie_jar_free(jar)
+    return 0
+}
+
+fn test_cookie_overwrite() -> int {
+    let jar = http_cookie_jar_new()
+    if jar == 0 { return 1 }
+    http_cookie_set(jar, "h.test", "/", "k", "v1", false)
+    http_cookie_set(jar, "h.test", "/", "k", "v2", false)
+    // same name+domain+path replaces, so still one cookie
+    if http_cookie_count(jar) != 1 { http_cookie_jar_free(jar); return 2 }
+    let v = http_cookie_get(jar, "h.test", "k")
+    if !text_eq(v, "v2") { free(v); http_cookie_jar_free(jar); return 3 }
+    free(v)
+    http_cookie_jar_free(jar)
+    return 0
+}
+
+fn test_cookie_header() -> int {
+    let jar = http_cookie_jar_new()
+    if jar == 0 { return 1 }
+    http_cookie_set(jar, "api.test", "/", "a", "1", false)
+    http_cookie_set(jar, "api.test", "/", "b", "2", false)
+
+    let hdr = http_cookie_header_for(jar, "api.test")
+    if hdr == 0 { http_cookie_jar_free(jar); return 2 }
+    if !text_contains(hdr, "a=1") { free(hdr); http_cookie_jar_free(jar); return 3 }
+    if !text_contains(hdr, "b=2") { free(hdr); http_cookie_jar_free(jar); return 4 }
+    free(hdr)
+
+    // a host with no cookies yields null, not an empty header
+    if http_cookie_header_for(jar, "nothing.test") != 0 { http_cookie_jar_free(jar); return 5 }
+
+    http_cookie_jar_free(jar)
+    return 0
+}
+
+fn test_cookie_growth() -> int {
+    // push well past the initial capacity to exercise the grow path. names are
+    // generated from the index so each is distinct.
+    let jar = http_cookie_jar_new()
+    if jar == 0 { return 1 }
+    var i = 0
+    while i < 50 {
+        let name = int_to_string(i)
+        let full = text_join2("k", name)
+        free(name)
+        http_cookie_set(jar, "big.test", "/", full, "v", false)
+        free(full)
+        i++
+    }
+    if http_cookie_count(jar) != 50 { http_cookie_jar_free(jar); return 2 }
+    let lastname = int_to_string(49)
+    let last = text_join2("k", lastname)
+    free(lastname)
+    let v = http_cookie_get(jar, "big.test", last)
+    if !text_eq(v, "v") { free(v); free(last); http_cookie_jar_free(jar); return 3 }
+    free(v)
+    free(last)
+    http_cookie_jar_free(jar)
+    return 0
+}
+
+fn test_set_cookie_parse() -> int {
+    let jar = http_cookie_jar_new()
+    if jar == 0 { return 1 }
+
+    // full attribute line: the value must stop at the first ';'
+    let ok = http_cookie_absorb_line(jar, "api.test", "sid=deadbeef; Path=/api; Domain=api.test; Secure; HttpOnly")
+    if !ok { http_cookie_jar_free(jar); return 2 }
+
+    let v = http_cookie_get(jar, "api.test", "sid")
+    if !text_eq(v, "deadbeef") { free(v); http_cookie_jar_free(jar); return 3 }
+    free(v)
+
+    // a bare "name=value" line with no attributes
+    http_cookie_absorb_line(jar, "plain.test", "t=1")
+    let v2 = http_cookie_get(jar, "plain.test", "t")
+    if !text_eq(v2, "1") { free(v2); http_cookie_jar_free(jar); return 4 }
+    free(v2)
+
+    // a line without '=' is not a cookie
+    if http_cookie_absorb_line(jar, "bad.test", "novalue") { http_cookie_jar_free(jar); return 5 }
+
+    http_cookie_jar_free(jar)
+    return 0
+}
+
+fn test_absorb_raw_headers() -> int {
+    let jar = http_cookie_jar_new()
+    if jar == 0 { return 1 }
+    let lit = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nSet-Cookie: a=1; Path=/\r\nSet-Cookie: b=2; Path=/\r\nX-Other: z\r\n\r\n"
+    let raw = string_substring(lit, 0, string_length(lit))
+    let n = http_cookie_absorb_headers(jar, "h.test", raw)
+    free(raw)
+    if n != 2 { http_cookie_jar_free(jar); return 2 }
+    if http_cookie_count(jar) != 2 { http_cookie_jar_free(jar); return 3 }
+    http_cookie_jar_free(jar)
+    return 0
+}
+
+// sink state is passed through the context pointer, curl-style: [0] = total
+// bytes, [1] = first byte seen (so both the chunk and its content are exercised)
+fn counting_sink(ptr ctx, ptr chunk, int len) -> int {
+    mem.write(ctx, mem.read(ctx) + len)
+    if mem.read(ctx) == len {
+        // first chunk: remember what the data actually looked like
+        mem.write(ctx + 8, mem.read8(chunk))
+    }
+    return 1
+}
+
+fn aborting_sink(ptr ctx, ptr chunk, int len) -> int {
+    mem.write(ctx, mem.read(ctx) + len)
+    mem.write(ctx + 8, mem.read8(chunk))
+    return 0
+}
+
+fn test_sink_signatures() -> int {
+    // the sink type must be reachable, storable in a config, and callable
+    // through the stored function pointer with a real buffer
+    let cfg = http_config_new()
+    if cfg == 0 { return 1 }
+    let cell = malloc(16)
+    if cell == 0 { http_config_free(cfg); return 2 }
+    mem.write(cell, 0)
+    mem.write(cell + 8, 0)
+
+    http_config_set_sink_ctx(cfg, &counting_sink, cell)
+    if cfg.stream_sink == 0 { free(cell); http_config_free(cfg); return 3 }
+    if cfg.stream_context != cell { free(cell); http_config_free(cfg); return 4 }
+
+    // call it the way the transport does: (context, chunk, len)
+    let buf = malloc(16)
+    if buf == 0 { free(cell); http_config_free(cfg); return 5 }
+    mem.write8(buf, 42)
+    let sink = cfg.stream_sink as HttpSinkFn
+    if sink(cfg.stream_context, buf, 7) == 0 { free(buf); free(cell); http_config_free(cfg); return 6 }
+    if mem.read(cell) != 7 { free(buf); free(cell); http_config_free(cfg); return 7 }
+    if mem.read(cell + 8) != 42 { free(buf); free(cell); http_config_free(cfg); return 8 }
+
+    // an aborting sink returns 0 (the transport then stops the transfer)
+    http_config_set_sink_ctx(cfg, &aborting_sink, cell)
+    if cfg.stream_sink == 0 { free(buf); free(cell); http_config_free(cfg); return 9 }
+    let abort_sink = cfg.stream_sink as HttpSinkFn
+    if abort_sink(cfg.stream_context, buf, 3) != 0 { free(buf); free(cell); http_config_free(cfg); return 10 }
+
+    free(buf)
+    free(cell)
+    http_config_free(cfg)
+    return 0
+}
+
+fn test_request_config_attach() -> int {
+    let cfg = http_config_new()
+    if cfg == 0 { return 1 }
+    let req = http_request_new("GET", "https://example.com/")
+    if req == 0 { http_config_free(cfg); return 2 }
+    http_request_set_config(req, cfg)
+    if req.config != cfg { http_request_free(req); http_config_free(cfg); return 3 }
+    // detaching is allowed
+    http_request_set_config(req, 0)
+    if req.config != 0 { http_request_free(req); http_config_free(cfg); return 4 }
+    http_request_free(req)
+    http_config_free(cfg)
+    return 0
+}
+
+fn test_jar_attached_to_config() -> int {
+    let cfg = http_config_new()
+    let jar = http_cookie_jar_new()
+    if cfg == 0 or jar == 0 { http_config_free(cfg); http_cookie_jar_free(jar); return 1 }
+    http_config_set_cookie_jar(cfg, jar)
+    if cfg.cookie_jar != jar { http_config_free(cfg); http_cookie_jar_free(jar); return 2 }
+    if cfg.enable_cookies != 1 { http_config_free(cfg); http_cookie_jar_free(jar); return 3 }
+    http_config_free(cfg)
+    http_cookie_jar_free(jar)
+    return 0
+}
+
+fn test_null_safety() -> int {
+    // every accessor must survive a null handle
+    if http_cookie_count(0 as HttpCookieJar) != 0 { return 1 }
+    if http_cookie_get(0 as HttpCookieJar, "h", "n") != 0 { return 2 }
+    if http_cookie_header_for(0 as HttpCookieJar, "h") != 0 { return 3 }
+    http_cookie_set(0 as HttpCookieJar, "h", "/", "n", "v", false)
+    http_cookie_jar_free(0 as HttpCookieJar)
+    http_config_free(0 as HttpConfig)
+    http_config_set_proxy(0 as HttpConfig, "x", "y")
+    http_config_set_tls(0 as HttpConfig, HttpTlsVerify.IgnoreAll)
+    http_config_set_http_version(0 as HttpConfig, HttpVersion.Http2)
+    http_config_set_sink(0 as HttpConfig, &counting_sink)
+    return 0
+}
+
+fn main() -> int {
+    let r1 = test_config_defaults()
+    if r1 != 0 { return 10 + r1 }
+    let r2 = test_config_setters()
+    if r2 != 0 { return 20 + r2 }
+    let r3 = test_cookie_jar_basic()
+    if r3 != 0 { return 30 + r3 }
+    let r4 = test_cookie_overwrite()
+    if r4 != 0 { return 40 + r4 }
+    let r5 = test_cookie_header()
+    if r5 != 0 { return 50 + r5 }
+    let r6 = test_cookie_growth()
+    if r6 != 0 { return 60 + r6 }
+    let r7 = test_set_cookie_parse()
+    if r7 != 0 { return 70 + r7 }
+    let r8 = test_absorb_raw_headers()
+    if r8 != 0 { return 80 + r8 }
+    let r9 = test_sink_signatures()
+    if r9 != 0 { return 90 + r9 }
+    let r10 = test_request_config_attach()
+    if r10 != 0 { return 100 + r10 }
+    let r11 = test_jar_attached_to_config()
+    if r11 != 0 { return 110 + r11 }
+    let r12 = test_null_safety()
+    if r12 != 0 { return 120 + r12 }
+
+    print("http parity: all tests passed\n")
+    return 0
+}
