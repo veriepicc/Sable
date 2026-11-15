@@ -2,38 +2,38 @@
 
 - **Date:** 2026-11-15
 - **Host:** `Windows AMD64`
-- **CPU:** `INTEL(R) XEON(R) PLATINUM 8573C`
-- **Toolchains:** Sable (native x64), MSVC (`/O2 /arch:AVX512 /Ob2 /Oi /Ot /GS-`), GCC (`-O3 -march=native -mprefer-vector-width=512 -fwrapv`), TCC
+- **CPU:** `AMD EPYC 7763 64-Core Processor`
+- **Toolchains:** Sable (native x64), MSVC (`/O2 /arch:AVX2 /Ob2 /Oi /Ot /GS-`), GCC (`-O3 -march=native -fwrapv`), TCC
 
 ## Execution Runtime (lower is better)
 
 | Workload | Sable | MSVC | GCC | TCC | Winner |
 | :--- | ---: | ---: | ---: | ---: | :---: |
-| **Math Loop (80M iter)** | **4.87 ms** | 20.39 ms | 5.96 ms | 110.14 ms | **Sable** |
-| **State Accumulation (50M iter)** | **4.52 ms** | 22.84 ms | 5.83 ms | 69.87 ms | **Sable** |
-| **Branch Parity (40M iter)** | **4.71 ms** | 33.10 ms | 19.72 ms | 64.52 ms | **Sable** |
-| **General Logic (6M iter)** | 24.13 ms | 19.65 ms | **15.71 ms** | 41.47 ms | **GCC** |
-| **HFT Order Book (12M iter)** | 188.47 ms | 129.21 ms | **122.34 ms** | 268.33 ms | **GCC** |
-| **Math SIMD Vector (40M items)** | **47.86 ms** | 238.85 ms | 236.93 ms | 297.64 ms | **Sable** |
-| **State SIMD Vector (40M items)** | **47.82 ms** | 369.70 ms | 357.79 ms | 467.19 ms | **Sable** |
-| **Branch SIMD Vector (40M items)** | **47.39 ms** | 240.45 ms | 236.56 ms | 311.01 ms | **Sable** |
-| **General SIMD Vector (20M items)** | **26.35 ms** | 187.76 ms | 179.28 ms | 242.23 ms | **Sable** |
-| **HFT SIMD Vector (20M items)** | **26.00 ms** | 177.43 ms | 179.39 ms | 235.78 ms | **Sable** |
+| **Math Loop (80M iter)** | **4.42 ms** | 30.95 ms | 5.75 ms | 131.58 ms | **Sable** |
+| **State Accumulation (50M iter)** | **4.52 ms** | 21.99 ms | 5.70 ms | 84.90 ms | **Sable** |
+| **Branch Parity (40M iter)** | **4.33 ms** | 31.17 ms | 20.11 ms | 51.32 ms | **Sable** |
+| **General Logic (6M iter)** | 23.58 ms | **19.34 ms** | 19.58 ms | 48.40 ms | **MSVC** |
+| **HFT Order Book (12M iter)** | 192.35 ms | 141.52 ms | **131.56 ms** | 400.49 ms | **GCC** |
+| **Math SIMD Vector (40M items)** | **46.10 ms** | 132.84 ms | 133.65 ms | 211.33 ms | **Sable** |
+| **State SIMD Vector (40M items)** | **45.66 ms** | 193.55 ms | 200.70 ms | 347.19 ms | **Sable** |
+| **Branch SIMD Vector (40M items)** | **46.40 ms** | 143.86 ms | 133.61 ms | 242.49 ms | **Sable** |
+| **General SIMD Vector (20M items)** | **25.54 ms** | 104.56 ms | 101.50 ms | 190.85 ms | **Sable** |
+| **HFT SIMD Vector (20M items)** | **25.74 ms** | 106.64 ms | 101.78 ms | 192.59 ms | **Sable** |
 
 ## Compilation Speed & Binary Size
 
-| Workload | Sable | MSVC (`/O2 /arch:AVX512`) | GCC (`-O3 -march=native -mprefer-vector-width=512`) | TCC |
+| Workload | Sable | MSVC (`/O2 /arch:AVX2`) | GCC (`-O3 -march=native`) | TCC |
 | :--- | ---: | ---: | ---: | ---: |
-| **Math Loop (80M iter)** | **13.1 ms (5.0 KiB)** | 229.6 ms (105.0 KiB) | 3245.3 ms (14.5 KiB) | 16.1 ms (2.5 KiB) |
-| **State Accumulation (50M iter)** | **9.3 ms (5.0 KiB)** | 109.8 ms (105.0 KiB) | 110.8 ms (14.5 KiB) | 10.9 ms (2.5 KiB) |
-| **Branch Parity (40M iter)** | **10.1 ms (5.0 KiB)** | 114.5 ms (105.0 KiB) | 341.0 ms (14.5 KiB) | 11.2 ms (2.5 KiB) |
-| **General Logic (6M iter)** | **9.7 ms (5.0 KiB)** | 125.4 ms (105.5 KiB) | 165.4 ms (14.5 KiB) | 11.1 ms (2.5 KiB) |
-| **HFT Order Book (12M iter)** | **10.5 ms (6.0 KiB)** | 157.0 ms (106.0 KiB) | 215.1 ms (15.0 KiB) | 11.5 ms (4.0 KiB) |
-| **Math SIMD Vector (40M items)** | **9.7 ms (9.5 KiB)** | 191.2 ms (106.5 KiB) | 237.1 ms (15.0 KiB) | 11.3 ms (2.5 KiB) |
-| **State SIMD Vector (40M items)** | **10.1 ms (8.0 KiB)** | 121.1 ms (106.0 KiB) | 128.0 ms (14.5 KiB) | 12.6 ms (2.5 KiB) |
-| **Branch SIMD Vector (40M items)** | **10.0 ms (10.5 KiB)** | 128.6 ms (106.5 KiB) | 125.7 ms (15.0 KiB) | 11.5 ms (2.5 KiB) |
-| **General SIMD Vector (20M items)** | **9.8 ms (8.0 KiB)** | 115.3 ms (106.0 KiB) | 121.6 ms (14.5 KiB) | 11.4 ms (2.5 KiB) |
-| **HFT SIMD Vector (20M items)** | **9.8 ms (10.0 KiB)** | 121.1 ms (107.0 KiB) | 130.4 ms (15.5 KiB) | 11.7 ms (2.5 KiB) |
+| **Math Loop (80M iter)** | 20.7 ms (5.0 KiB) | 247.9 ms (105.0 KiB) | 3898.2 ms (14.5 KiB) | **15.6 ms (2.5 KiB)** |
+| **State Accumulation (50M iter)** | **9.4 ms (5.0 KiB)** | 114.0 ms (105.0 KiB) | 112.7 ms (14.5 KiB) | 11.0 ms (2.5 KiB) |
+| **Branch Parity (40M iter)** | **9.7 ms (5.0 KiB)** | 107.2 ms (105.0 KiB) | 381.0 ms (14.5 KiB) | 12.0 ms (2.5 KiB) |
+| **General Logic (6M iter)** | **9.4 ms (5.0 KiB)** | 136.0 ms (105.5 KiB) | 168.8 ms (14.5 KiB) | 11.1 ms (2.5 KiB) |
+| **HFT Order Book (12M iter)** | **10.6 ms (6.0 KiB)** | 152.4 ms (106.0 KiB) | 218.6 ms (15.0 KiB) | 11.4 ms (4.0 KiB) |
+| **Math SIMD Vector (40M items)** | **10.1 ms (9.5 KiB)** | 192.8 ms (106.0 KiB) | 252.0 ms (15.0 KiB) | 11.6 ms (2.5 KiB) |
+| **State SIMD Vector (40M items)** | **9.6 ms (8.0 KiB)** | 118.7 ms (106.0 KiB) | 132.0 ms (14.5 KiB) | 11.7 ms (2.5 KiB) |
+| **Branch SIMD Vector (40M items)** | **9.7 ms (10.5 KiB)** | 137.7 ms (106.0 KiB) | 128.4 ms (15.0 KiB) | 11.5 ms (2.5 KiB) |
+| **General SIMD Vector (20M items)** | **9.5 ms (8.0 KiB)** | 115.4 ms (106.0 KiB) | 122.8 ms (14.5 KiB) | 11.3 ms (2.5 KiB) |
+| **HFT SIMD Vector (20M items)** | **9.9 ms (10.0 KiB)** | 123.3 ms (106.5 KiB) | 130.0 ms (15.0 KiB) | 11.3 ms (2.5 KiB) |
 
 ## Reproduction
 
@@ -46,12 +46,12 @@ python benchmarks/run.py --iterations 5 --warmup 2
 ### Scalar Benchmarks
 | Architecture & Host | Processor Model | Math (80M) | State (50M) | Branch (40M) | General (6M) | HFT (12M) | Math Vec (40M) | State Vec (40M) | Branch Vec (40M) | General Vec (20M) | HFT Vec (20M) |
 | :--- | :--- | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **Windows AMD64** | `INTEL(R) XEON(R) PLATINUM 8573C` | 13ms / **4.87ms** | 9ms / **4.52ms** | 10ms / **4.71ms** | 10ms / **24.13ms** | 10ms / **188.47ms** | 10ms / **47.86ms** | 10ms / **47.82ms** | 10ms / **47.39ms** | 10ms / **26.35ms** | 10ms / **26.00ms** |
-| **Windows AMD64** | `AMD EPYC 9V45 96-Core Processor` | 7ms / **2.11ms** | 6ms / **2.07ms** | 5ms / **2.10ms** | 6ms / **12.36ms** | 6ms / **112.02ms** | 6ms / **18.05ms** | 6ms / **20.50ms** | 6ms / **21.15ms** | 6ms / **12.53ms** | 6ms / **11.66ms** |
-| **Windows ARM64 (Prism x64)** | `Cobalt 100` | 127ms / **13.87ms** | 28ms / **13.76ms** | 29ms / **13.85ms** | 39ms / **29.25ms** | 31ms / **210.82ms** | 40ms / **48.19ms** | 29ms / **44.84ms** | 29ms / **53.86ms** | 28ms / **30.09ms** | 28ms / **33.59ms** |
-| **Linux x86_64** | `AMD EPYC 7763 64-Core Processor` | 32ms / **23.80ms** | 35ms / **22.71ms** | 34ms / **22.68ms** | 37ms / **46.74ms** | 32ms / **207.81ms** | 32ms / **106.90ms** | 33ms / **108.17ms** | 31ms / **107.11ms** | 32ms / **66.95ms** | 33ms / **65.23ms** |
+| **Windows AMD64** | `AMD EPYC 7763 64-Core Processor` | 21ms / **4.42ms** | 9ms / **4.52ms** | 10ms / **4.33ms** | 9ms / **23.58ms** | 11ms / **192.35ms** | 10ms / **46.10ms** | 10ms / **45.66ms** | 10ms / **46.40ms** | 9ms / **25.54ms** | 10ms / **25.74ms** |
+| **Windows AMD64** | `AMD EPYC 7763 64-Core Processor` | 10ms / **3.19ms** | 7ms / **3.28ms** | 8ms / **3.27ms** | 8ms / **22.62ms** | 8ms / **187.24ms** | 8ms / **39.89ms** | 7ms / **43.56ms** | 8ms / **42.03ms** | 7ms / **23.15ms** | 8ms / **23.79ms** |
+| **Windows ARM64 (Prism x64)** | `Cobalt 100` | 142ms / **13.57ms** | 29ms / **14.03ms** | 28ms / **13.85ms** | 39ms / **29.80ms** | 36ms / **210.50ms** | 40ms / **47.81ms** | 29ms / **44.33ms** | 28ms / **53.23ms** | 28ms / **29.87ms** | 37ms / **32.41ms** |
+| **Linux x86_64** | `AMD EPYC 9V45 96-Core Processor` | 37ms / **18.22ms** | 24ms / **18.15ms** | 25ms / **17.94ms** | 29ms / **28.05ms** | 84ms / **126.27ms** | 145ms / **71.97ms** | 25ms / **73.30ms** | 26ms / **73.74ms** | 25ms / **47.19ms** | 24ms / **47.72ms** |
 
-Automated multi-host benchmarks recorded on [CI Run](https://github.com/veriepicc/Sable/actions/runs/43720743159) · Source: `aefb6159240a`.
+Automated multi-host benchmarks recorded on [CI Run](https://github.com/veriepicc/Sable/actions/runs/43723357219) · Source: `c66922de33bb`.
 
 ## Reproduction
 
