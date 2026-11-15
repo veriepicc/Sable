@@ -1948,5 +1948,15 @@
       "codec: all tests passed\n"
     ],
     "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
+    "Name": "test_math",
+    "File": "tests/test_math.sb",
+    "ExpectedExit": 0,
+    "ExpectedRuntimeOutputContains": [
+      "math: all tests passed\n"
+    ],
+    "RuntimeTimeoutSeconds": 10
   }
 ]

@@ -1,0 +1,134 @@
+import math
+
+// correctness of stdlib/mathx.sb: number theory, integer roots, sequences, and
+// overflow-checked arithmetic, checked against known values.
+
+function int test_gcd_lcm() {
+    if math_gcd(48, 18) != 6 { print("FAIL gcd 48,18\n"); return 1 }
+    if math_gcd(0, 7) != 7 { print("FAIL gcd 0,7\n"); return 2 }
+    if math_gcd(0, 0) != 0 { print("FAIL gcd 0,0\n"); return 3 }
+    if math_gcd(0 - 12, 18) != 6 { print("FAIL gcd neg\n"); return 4 }
+    if math_gcd(17, 5) != 1 { print("FAIL gcd coprime\n"); return 5 }
+
+    if math_lcm(4, 6) != 12 { print("FAIL lcm 4,6\n"); return 6 }
+    if math_lcm(0, 5) != 0 { print("FAIL lcm 0\n"); return 7 }
+    if math_lcm(21, 6) != 42 { print("FAIL lcm 21,6\n"); return 8 }
+    return 0
+}
+
+function int test_mod() {
+    if math_mod(7, 3) != 1 { print("FAIL mod 7,3\n"); return 1 }
+    if math_mod(0 - 1, 3) != 2 { print("FAIL mod -1,3\n"); return 2 }
+    if math_mod(0 - 7, 3) != 2 { print("FAIL mod -7,3\n"); return 3 }
+    if math_mod(5, 0) != 0 { print("FAIL mod by zero\n"); return 4 }
+    if math_mod(6, 3) != 0 { print("FAIL mod 6,3\n"); return 5 }
+    return 0
+}
+
+function int test_pow_mod() {
+    // 2^10 mod 1000 = 1024 mod 1000 = 24
+    if math_pow_mod(2, 10, 1000) != 24 { print("FAIL powmod 2^10\n"); return 1 }
+    // 3^4 mod 5 = 81 mod 5 = 1
+    if math_pow_mod(3, 4, 5) != 1 { print("FAIL powmod 3^4\n"); return 2 }
+    // x^0 mod m = 1 mod m
+    if math_pow_mod(5, 0, 7) != 1 { print("FAIL powmod exp0\n"); return 3 }
+    // negative base: (-2)^3 mod 5 = -8 mod 5 = 2
+    if math_pow_mod(0 - 2, 3, 5) != 2 { print("FAIL powmod neg base\n"); return 4 }
+    if math_pow_mod(2, 10, 0) != 0 { print("FAIL powmod mod0\n"); return 5 }
+    return 0
+}
+
+function int test_isqrt() {
+    if math_isqrt(0) != 0 { print("FAIL isqrt 0\n"); return 1 }
+    if math_isqrt(1) != 1 { print("FAIL isqrt 1\n"); return 2 }
+    if math_isqrt(15) != 3 { print("FAIL isqrt 15\n"); return 3 }
+    if math_isqrt(16) != 4 { print("FAIL isqrt 16\n"); return 4 }
+    if math_isqrt(17) != 4 { print("FAIL isqrt 17\n"); return 5 }
+    if math_isqrt(100000000) != 10000 { print("FAIL isqrt 1e8\n"); return 6 }
+    if math_isqrt(0 - 5) != 0 { print("FAIL isqrt neg\n"); return 7 }
+
+    if !math_is_square(49) { print("FAIL is_square 49\n"); return 8 }
+    if math_is_square(50) { print("FAIL is_square 50\n"); return 9 }
+    if !math_is_square(0) { print("FAIL is_square 0\n"); return 10 }
+    if math_is_square(0 - 4) { print("FAIL is_square neg\n"); return 11 }
+    return 0
+}
+
+function int test_nth_root() {
+    if math_nth_root(27, 3) != 3 { print("FAIL cbrt 27\n"); return 1 }
+    if math_nth_root(28, 3) != 3 { print("FAIL cbrt 28\n"); return 2 }
+    if math_nth_root(8, 3) != 2 { print("FAIL cbrt 8\n"); return 3 }
+    if math_nth_root(1000000, 3) != 100 { print("FAIL cbrt 1e6\n"); return 4 }
+    if math_nth_root(15, 1) != 15 { print("FAIL root k=1\n"); return 5 }
+    if math_nth_root(5, 0) != 0 { print("FAIL root k=0\n"); return 6 }
+    if math_nth_root(0, 3) != 0 { print("FAIL root 0\n"); return 7 }
+    return 0
+}
+
+function int test_sequences() {
+    if math_factorial(0) != 1 { print("FAIL 0!\n"); return 1 }
+    if math_factorial(1) != 1 { print("FAIL 1!\n"); return 2 }
+    if math_factorial(5) != 120 { print("FAIL 5!\n"); return 3 }
+    if math_factorial(10) != 3628800 { print("FAIL 10!\n"); return 4 }
+    if math_factorial(0 - 1) != 0 { print("FAIL neg !\n"); return 5 }
+
+    if math_fibonacci(0) != 0 { print("FAIL fib0\n"); return 6 }
+    if math_fibonacci(1) != 1 { print("FAIL fib1\n"); return 7 }
+    if math_fibonacci(10) != 55 { print("FAIL fib10\n"); return 8 }
+    if math_fibonacci(20) != 6765 { print("FAIL fib20\n"); return 9 }
+
+    if math_binomial(5, 2) != 10 { print("FAIL C(5,2)\n"); return 10 }
+    if math_binomial(10, 5) != 252 { print("FAIL C(10,5)\n"); return 11 }
+    if math_binomial(5, 0) != 1 { print("FAIL C(5,0)\n"); return 12 }
+    if math_binomial(5, 5) != 1 { print("FAIL C(5,5)\n"); return 13 }
+    if math_binomial(5, 6) != 0 { print("FAIL C(5,6)\n"); return 14 }
+    return 0
+}
+
+function int test_checked() {
+    let big = 9223372036854775807
+    let min = 0 - 9223372036854775807 - 1
+
+    // sane cases pass through
+    if math_checked_add(2, 3, 0 - 1) != 5 { print("FAIL add ok\n"); return 1 }
+    if math_checked_sub(10, 4, 0 - 1) != 6 { print("FAIL sub ok\n"); return 2 }
+    if math_checked_mul(6, 7, 0 - 1) != 42 { print("FAIL mul ok\n"); return 3 }
+
+    // overflow yields the fallback, never wraps
+    if math_checked_add(big, 1, 0 - 42) != (0 - 42) { print("FAIL add overflow\n"); return 4 }
+    if math_checked_sub(min, 1, 0 - 42) != (0 - 42) { print("FAIL sub overflow\n"); return 5 }
+    if math_checked_mul(big, 2, 0 - 42) != (0 - 42) { print("FAIL mul overflow\n"); return 6 }
+    if math_checked_mul(min, 0 - 1, 0 - 42) != (0 - 42) { print("FAIL mul MIN*-1\n"); return 7 }
+
+    // zero short-circuits
+    if math_checked_mul(0, big, 0 - 1) != 0 { print("FAIL mul zero\n"); return 8 }
+
+    // clamp
+    if math_clamp(5, 1, 10) != 5 { print("FAIL clamp in\n"); return 9 }
+    if math_clamp(0, 1, 10) != 1 { print("FAIL clamp lo\n"); return 10 }
+    if math_clamp(99, 1, 10) != 10 { print("FAIL clamp hi\n"); return 11 }
+    if math_clamp(5, 10, 1) != 5 { print("FAIL clamp swapped\n"); return 12 }
+    return 0
+}
+
+function int main() {
+    alloc_console()
+
+    let r1 = test_gcd_lcm()
+    if r1 != 0 { return 10 + r1 }
+    let r2 = test_mod()
+    if r2 != 0 { return 20 + r2 }
+    let r3 = test_pow_mod()
+    if r3 != 0 { return 30 + r3 }
+    let r4 = test_isqrt()
+    if r4 != 0 { return 40 + r4 }
+    let r5 = test_nth_root()
+    if r5 != 0 { return 50 + r5 }
+    let r6 = test_sequences()
+    if r6 != 0 { return 60 + r6 }
+    let r7 = test_checked()
+    if r7 != 0 { return 70 + r7 }
+
+    print("math: all tests passed\n")
+    return 0
+}

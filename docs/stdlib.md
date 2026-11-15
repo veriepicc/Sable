@@ -35,6 +35,7 @@ import fmt
 | `bitset` | growable bitset over heap words: get/set/toggle, popcount, find, set algebra |
 | `strbuf` | growable string builder: `strbuf_append`, `strbuf_append_int`, `strbuf_to_string` |
 | `codec` | hex and base64 encode/decode over bytes and strings, with `*_into` variants |
+| `math` | integer math: gcd/lcm, mod, pow_mod, isqrt, ipow, factorial, binomial, checked_* |
 | `prelude` | convenience bundle importing core modules |
 
 ## `mem`
@@ -337,6 +338,28 @@ caller buffer and allocate nothing. Decode skips non-alphabet characters (so
 with `codec_*_decode_to_bytes` into a buffer sized by `codec_*_decoded_len`, since
 a native-image `str` is NUL-terminated and cannot carry an embedded `0x00`
 length. `codec_hex_roundtrip`/`codec_b64_roundtrip` self-check a buffer.
+
+## `math`
+
+Integer mathematics: number theory, roots, sequences, and overflow-checked
+arithmetic. All pure.
+
+```c
+import math
+
+function int main() {
+    let g = math_gcd(48, 18)          // 6
+    let r = math_isqrt(100000000)     // 10000
+    let m = math_pow_mod(2, 10, 1000) // 24
+    let s = math_checked_add(9223372036854775807, 1, -1)  // -1 (overflow)
+    return 0
+}
+```
+
+`math_gcd`, `math_lcm`, `math_mod` (Euclidean, always non-negative),
+`math_pow_mod`, `math_ext_gcd`, `math_isqrt`, `math_nth_root`, `math_ipow`,
+`math_factorial`, `math_binomial`, `math_fibonacci`, and the `math_checked_add` /
+`_sub` / `_mul` helpers that return a fallback instead of wrapping.
 
 ## Notes
 
