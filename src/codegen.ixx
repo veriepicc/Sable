@@ -425,6 +425,17 @@ public:
         auto size = buf.pos();
         if (size < 6) return;
 
+        // a branch may land inside an instruction's byte range; never rewrite one
+        auto reachable = [&](std::size_t start, std::size_t len) {
+            const auto& targets = emit_.jump_targets();
+            for (std::size_t b = start; b < start + len; ++b) {
+                if (targets.contains(b)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         int eliminated = 0;
 
         // pass 1: eliminate mov dst,src; mov src,dst (copy-back redundancy)
@@ -452,6 +463,7 @@ public:
 
             // eliminate mov reg,reg where dst == src (identity move)
             if (full_reg1 == full_rm1) {
+                if (reachable(i, 3)) { i += 3; continue; }
                 code[i] = 0x90; code[i+1] = 0x90; code[i+2] = 0x90;
                 eliminated++;
                 i += 3;
@@ -476,6 +488,9 @@ public:
                 std::uint8_t full_rm2 = rm2_field + (rm2_ext ? 8 : 0);
 
                 if (full_reg1 == full_rm2 && full_rm1 == full_reg2) {
+                    // only safe when neither mov is a branch landing spot: a jump to
+                    // the second mov would otherwise lose the value it copies back.
+                    if (reachable(i, 6)) { i += 6; continue; }
                     code[i+3] = 0x90; code[i+4] = 0x90; code[i+5] = 0x90;
                     eliminated++;
                     i += 6;
@@ -1754,14 +1769,18 @@ private:
 
     void patch_rel32(std::size_t patch_site, std::size_t target) {
         emit_.buffer().patch32(patch_site, static_cast<std::uint32_t>(rel32_from_patch(patch_site, target)));
+        emit_.note_jump_target(target);
     }
 
     [[nodiscard]] std::int32_t rel32_from_next_jmp(std::size_t target) {
         return emit_.buffer().rel32(emit_.buffer().pos() + 1, target);
     }
 
+    // `emit_.jmp_rel32(offset)` writes a raw jump whose target is not otherwise
+    // recorded; compute and record it so the peephole cannot delete the landing spot.
     void emit_jmp_rel32_to(std::size_t target) {
         emit_.jmp_rel32(rel32_from_next_jmp(target));
+        emit_.note_jump_target(target);
     }
 
     void emit_current_epilogue() {
@@ -3858,9 +3877,121 @@ private:
         return true;
     }
 
-    [[nodiscard]] static bool expr_contains_call(const ast::Expr& expr) {
+    // true when an expression contains a division or modulo. the idiv/cqo sequence
+    // writes its remainder into RDX, so a function body with one of these must not
+    // keep any value registerized in RDX across it (see try_make_function_leaf_register_plan).
+    [[nodiscard]] static bool expr_contains_divmod(const ast::Expr& expr) {
         return std::visit(overloaded{
             [&](const ast::LiteralExpr&) { return false; },
+            [&](const ast::IdentExpr&) { return false; },
+            [&](const ast::UnaryExpr& e) { return e.operand && expr_contains_divmod(*e.operand); },
+            [&](const ast::BinaryExpr& e) {
+                if (e.op == ast::BinaryExpr::Op::Div || e.op == ast::BinaryExpr::Op::Mod ||
+                    e.op == ast::BinaryExpr::Op::DivAssign || e.op == ast::BinaryExpr::Op::ModAssign) {
+                    return true;
+                }
+                return (e.lhs && expr_contains_divmod(*e.lhs)) ||
+                       (e.rhs && expr_contains_divmod(*e.rhs));
+            },
+            [&](const ast::IndexExpr& e) {
+                return (e.base && expr_contains_divmod(*e.base)) ||
+                       (e.index && expr_contains_divmod(*e.index));
+            },
+            [&](const ast::FieldExpr& e) { return e.base && expr_contains_divmod(*e.base); },
+            [&](const ast::CastExpr& e) { return e.expr && expr_contains_divmod(*e.expr); },
+            [&](const ast::CallExpr& e) {
+                if (e.callee && expr_contains_divmod(*e.callee)) return true;
+                for (const auto& a : e.args) {
+                    if (a && expr_contains_divmod(*a)) return true;
+                }
+                return false;
+            },
+            [&](const ast::FStringExpr& e) {
+                for (const auto& part : e.parts) {
+                    if (part.expr && expr_contains_divmod(*part.expr)) return true;
+                }
+                return false;
+            },
+            [&](const ast::ArrayExpr& e) {
+                for (const auto& el : e.elements) {
+                    if (el && expr_contains_divmod(*el)) return true;
+                }
+                return false;
+            },
+            [&](const ast::StructExpr& e) {
+                for (const auto& [_, v] : e.fields) {
+                    if (v && expr_contains_divmod(*v)) return true;
+                }
+                return false;
+            },
+            [&](const auto&) { return false; },
+        }, expr.kind);
+    }
+
+    [[nodiscard]] static bool stmt_contains_divmod(const ast::Stmt& stmt) {
+        return std::visit(overloaded{
+            [&](const ast::LetStmt& s) { return s.init && expr_contains_divmod(*s.init); },
+            [&](const ast::ExprStmt& s) { return s.expr && expr_contains_divmod(*s.expr); },
+            [&](const ast::ReturnStmt& s) { return s.value && expr_contains_divmod(*s.value); },
+            [&](const ast::IfStmt& s) {
+                if (s.condition && expr_contains_divmod(*s.condition)) return true;
+                for (const auto& inner : s.then_block) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                if (s.else_block) {
+                    for (const auto& inner : *s.else_block) {
+                        if (stmt_contains_divmod(*inner)) return true;
+                    }
+                }
+                return false;
+            },
+            [&](const ast::SwitchStmt& s) {
+                if (s.subject && expr_contains_divmod(*s.subject)) return true;
+                for (const auto& branch : s.cases) {
+                    if (branch.value && expr_contains_divmod(*branch.value)) return true;
+                    for (const auto& inner : branch.body) {
+                        if (stmt_contains_divmod(*inner)) return true;
+                    }
+                }
+                if (s.else_block) {
+                    for (const auto& inner : *s.else_block) {
+                        if (stmt_contains_divmod(*inner)) return true;
+                    }
+                }
+                return false;
+            },
+            [&](const ast::WhileStmt& s) {
+                if (s.condition && expr_contains_divmod(*s.condition)) return true;
+                for (const auto& inner : s.body) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                return false;
+            },
+            [&](const ast::ForStmt& s) {
+                if (s.iterable && expr_contains_divmod(*s.iterable)) return true;
+                for (const auto& inner : s.body) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                return false;
+            },
+            [&](const ast::LoopStmt& s) {
+                for (const auto& inner : s.body) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                return false;
+            },
+            [&](const ast::BlockStmt& s) {
+                for (const auto& inner : s.block.stmts) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                return false;
+            },
+            [&](const auto&) { return false; },
+        }, stmt.kind);
+    }
+
+    [[nodiscard]] static bool expr_contains_call(const ast::Expr& expr) {
+        return std::visit(overloaded{            [&](const ast::LiteralExpr&) { return false; },
             [&](const ast::IdentExpr&) { return false; },
             [&](const ast::UnaryExpr& e) { return expr_contains_call(*e.operand); },
             [&](const ast::BinaryExpr& e) { return expr_contains_call(*e.lhs) || expr_contains_call(*e.rhs); },
@@ -4241,10 +4372,30 @@ private:
             }
         }
 
+        // a body containing a division or modulo uses RDX as the idiv scratch
+        // register (cqo writes the sign into RDX, idiv overwrites it with the
+        // remainder). registering any live value in RDX there would store a value
+        // into a register the divide destroys, so exclude RDX entirely.
+        bool body_has_divmod = false;
+        for (const auto& stmt : body) {
+            if (stmt_contains_divmod(*stmt)) {
+                body_has_divmod = true;
+                break;
+            }
+        }
+
         plan.param_regs.clear();
         plan.local_regs.clear();
         std::unordered_set<x64::Reg> used_regs;
+        if (body_has_divmod) {
+            used_regs.insert(x64::Reg::RDX);
+        }
         for (std::size_t i = 0; i < fn.params.size(); ++i) {
+            // a divmod body must not keep a live parameter in RDX (the divide
+            // clobbers it). leave that parameter in its stack slot instead.
+            if (body_has_divmod && x64::ARG_REGS[i] == x64::Reg::RDX) {
+                continue;
+            }
             plan.param_regs[fn.params[i].name] = x64::ARG_REGS[i];
             used_regs.insert(x64::ARG_REGS[i]);
         }
@@ -14374,6 +14525,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         }
 
         std::size_t done = emit_.buffer().pos();
+        bool any_patched = false;
         for (std::size_t patch : return_patches) {
             auto rel = static_cast<std::int32_t>(done) - static_cast<std::int32_t>(patch + 4);
             if (rel == 0 && patch > 0) {
@@ -14386,6 +14538,10 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 continue;
             }
             emit_.buffer().patch32(patch, static_cast<std::uint32_t>(rel));
+            any_patched = true;
+        }
+        if (any_patched) {
+            emit_.note_jump_target(done);
         }
 
         cleanup_inline_scope();
@@ -16340,6 +16496,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t loop_rel = static_cast<std::int32_t>(
             loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(loop_rel);
+        emit_.note_jump_target(loop_top);
 
         // not_equal: return 0
         emit_.patch_jump(jne_patch);
@@ -16393,6 +16550,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t loop_rel = static_cast<std::int32_t>(
             loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(loop_rel);
+        emit_.note_jump_target(loop_top);
 
         emit_.patch_jump(mismatch);
         std::size_t done = emit_.jmp_rel32_placeholder();
@@ -16590,6 +16748,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t loop_rel = static_cast<std::int32_t>(
             loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(loop_rel);
+        emit_.note_jump_target(loop_top);
 
         emit_.patch_jump(invalid);
         emit_.patch_jump(invalid_after_cmp);
@@ -16827,6 +16986,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t loop_rel = static_cast<std::int32_t>(
             loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(loop_rel);
+        emit_.note_jump_target(loop_top);
 
         emit_.patch_jump(loop_done);
         emit_.mov_load(x64::Reg::RCX, x64::Reg::RSP, 56);
@@ -19347,6 +19507,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t spawn_loop_rel = static_cast<std::int32_t>(
             spawn_loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(spawn_loop_rel);
+        emit_.note_jump_target(spawn_loop_top);
         emit_.patch_jump(spawn_loop_exit);
     }
 
@@ -19385,6 +19546,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t close_rel = static_cast<std::int32_t>(
             close_loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(close_rel);
+        emit_.note_jump_target(close_loop_top);
         emit_.patch_jump(close_loop_exit);
     }
 

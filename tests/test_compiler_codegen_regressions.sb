@@ -277,7 +277,64 @@ function int main() {
         return 40 + fg
     }
 
+    // 14: an idiv (from %) must not leave a stale value registered in RDX, and the
+    // peephole must not delete a move that a branch jumps directly onto.
+    let rg = test_divmod_rdx_and_jump_target_guards()
+    if rg != 0 {
+        return 50 + rg
+    }
+
     return 0
+}
+
+// Regression: `%` uses RDX as the idiv remainder register. A parameter that lands
+// in RDX (the 2nd argument) used to be destroyed by the divide and read back
+// clobbered. Also covers the peephole copy-back rule deleting `mov r8, rax` when a
+// conditional branch jumps straight onto it.
+function i64 divmod_param_in_rdx(i64 v, i64 m) {
+    var r = v % m
+    var pad1 = 0
+    var pad2 = 0
+    if r < 0 { r = r + m }
+    if r < 0 { r = 99 }
+    if pad1 > 0 { pad2 = 1 }
+    if pad2 > 0 { pad1 = 2 }
+    if pad1 > 1 { pad2 = 3 }
+    return r
+}
+
+function int test_divmod_rdx_and_jump_target_guards() {
+    // m is the 2nd parameter => bound to RDX by the leaf register plan. after the
+    // `%`, m must still be 3, so the correction gives -1 + 3 == 2.
+    if divmod_param_in_rdx(0 - 1, 3) != 2 { return 1 }
+    if divmod_param_in_rdx(0 - 7, 5) != 3 { return 2 }
+    if divmod_param_in_rdx(10, 3) != 1 { return 3 }
+
+    // the same modulo through a parameter that lands in RCX must also hold
+    if divmod_param_in_rcx(3, 0 - 1) != 2 { return 4 }
+
+    // a plain modulo used twice still yields the truncated remainders (-8 % 3 == -2,
+    // so a + b == -4)
+    if divmod_twice(0 - 8, 3) != (0 - 4) { return 5 }
+    return 0
+}
+
+function i64 divmod_param_in_rcx(i64 m, i64 v) {
+    var r = v % m
+    var pad1 = 0
+    var pad2 = 0
+    if r < 0 { r = r + m }
+    if r < 0 { r = 99 }
+    if pad1 > 0 { pad2 = 1 }
+    if pad2 > 0 { pad1 = 2 }
+    if pad1 > 1 { pad2 = 3 }
+    return r
+}
+
+function i64 divmod_twice(i64 v, i64 m) {
+    var a = v % m
+    var b = v % m
+    return a + b
 }
 
 struct NullGuardPoint {
