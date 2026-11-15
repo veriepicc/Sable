@@ -1805,5 +1805,23 @@
     "File": "tests/test_scripting_ergonomics.sb",
     "ExpectedExit": 0,
     "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_index_oob_literal",
+    "File": "tests/invalid_index_oob_literal.sb",
+    "ExpectedErrorContains": "out of bounds"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_index_negative",
+    "File": "tests/invalid_index_negative.sb",
+    "ExpectedErrorContains": "out of bounds"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_str_index_oob",
+    "File": "tests/invalid_str_index_oob.sb",
+    "ExpectedErrorContains": "out of bounds"
   }
 ]

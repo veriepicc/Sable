@@ -83,9 +83,26 @@ warning: f.sb:1:30: unused parameter 'not_used' [unused-parameter]
 Some conditions are always bugs and are rejected outright, not warned about:
 
 - dividing or taking a modulo by a literal `0`
+- indexing an array or string binding with a literal out-of-range index
+  (`let a = [1,2,3]  a[10]`, `"hi"[1000]`, or a negative literal index)
 - using `str`/`char` operands with arithmetic, bitwise, or ordering operators
   (`str < 0`, `int + str`, `str + str`) — use the string helpers instead
 - rebinding an immutable binding, or writing to a `for`/`parallel for` loop
   variable
 - revisiting an already-freed binding (use-after-free), double free
 - calling a builtin with the wrong number of arguments
+
+## Runtime guards
+
+The generated program must not fault on bad input. These cases are handled at
+the instruction level and yield a defined value instead of a `#DE`/page fault:
+
+- `/ 0` and `% 0` yield `0`; `INT64_MIN / -1` wraps to `INT64_MIN`
+- indexing through a null pointer (`p[i]`) reads `0`; a store is ignored
+- reading a field through a null struct pointer reads `0`; a store is ignored
+- a computed index past the end of a heap array reads `0`; a store is ignored
+
+Out of bounds *literal* indices are rejected at compile time (see above), so the
+runtime guards only cover computed indices. `mem.read`/`mem.write` remain raw:
+they fault on a bad address and are recovered by the SEH crash handler, which is
+the documented desugaring for direct memory access.

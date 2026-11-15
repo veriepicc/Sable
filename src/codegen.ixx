@@ -97,6 +97,14 @@ struct Symbol {
     std::int32_t stack_offset;  // Offset from RBP (negative = local)
     bool is_param = false;
     bool is_mut = false;
+    // known element count for a fixed-size array binding (nullopt = unknown). set
+    // for array literal initializers, string literals, and `T[N]` declarations,
+    // used for compile-time out-of-bounds diagnostics.
+    std::optional<std::size_t> array_len = std::nullopt;
+    // true when this binding owns a heap array with a length header at [base-16]
+    // (array-literal initializer under native-image output); enables the runtime
+    // bounds guard for computed indices.
+    bool is_heap_array = false;
 };
 
 struct Scope {
@@ -5997,6 +6005,29 @@ private:
         if (auto it = pending_named_register_bindings_.find(let.name); it != pending_named_register_bindings_.end()) {
             register_bindings_[&sym] = it->second;
         }
+        // track the element count of fixed-size array bindings so a literal index
+        // can be bounds-checked at compile time
+        if (let.init) {
+            if (auto* arr_lit = std::get_if<ast::ArrayExpr>(&let.init->kind)) {
+                sym.array_len = arr_lit->elements.size();
+                // only an immutable binding keeps this exact array for the whole
+                // scope, so the runtime bounds guard can trust its header
+                sym.is_heap_array = !let.is_mut;
+            } else if (auto* lit = std::get_if<ast::LiteralExpr>(&let.init->kind)) {
+                // a string literal binding: its length bounds a literal index
+                if (auto* s = std::get_if<std::string>(&lit->value)) {
+                    sym.array_len = s->size();
+                }
+            }
+        }
+        if (!sym.array_len && let.type) {
+            auto resolved = canonicalize_type(*let.type);
+            if (resolved) {
+                if (auto* arr_ty = std::get_if<ArrayType>(&resolved->kind); arr_ty && arr_ty->size) {
+                    sym.array_len = *arr_ty->size;
+                }
+            }
+        }
         return &sym;
     }
 
@@ -6072,11 +6103,22 @@ private:
                 return false;
             }
             std::size_t size = struct_it->second.total_size > 0 ? struct_it->second.total_size : 8;
+            // a null struct source must not fault: zero the destination instead
+            emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            for (std::size_t offset = 0; offset < size; offset += 8) {
+                auto chunk = static_cast<std::int32_t>(offset);
+                emit_.xor_(x64::Reg::R11, x64::Reg::R11);
+                emit_.mov_store(x64::Reg::RBP, sym.stack_offset + chunk, x64::Reg::R11);
+            }
+            std::size_t done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
             for (std::size_t offset = 0; offset < size; offset += 8) {
                 auto chunk = static_cast<std::int32_t>(offset);
                 emit_.mov_load(x64::Reg::R11, x64::Reg::RAX, chunk);
                 emit_.mov_store(x64::Reg::RBP, sym.stack_offset + chunk, x64::Reg::R11);
             }
+            emit_.patch_jump(done);
             if (auto bound = lookup_bound_reg(&sym)) {
                 emit_.lea(*bound, x64::Reg::RBP, sym.stack_offset);
             }
@@ -11548,11 +11590,23 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 return true;
             }
             emit_.mov_load(dst, x64::Reg::RBP, base_sym->stack_offset);
+            // a null struct pointer must not fault: leave the result as 0
+            emit_.test(dst, dst);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            std::size_t done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
             emit_.mov_load(dst, dst, offset);
+            emit_.patch_jump(done);
             return true;
         }
 
+        // same guard for the computed base pointer already in dst
+        emit_.test(dst, dst);
+        std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+        std::size_t done = emit_.jmp_rel32_placeholder();
+        emit_.patch_jump(non_null);
         emit_.mov_load(dst, dst, offset);
+        emit_.patch_jump(done);
         return true;
     }
 
@@ -11991,12 +12045,24 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 return true;
             }
             emit_.mov_load(x64::Reg::RAX, x64::Reg::RBP, base_sym->stack_offset);
+            // a null struct pointer must not fault: yield 0 instead of dereferencing
+            emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            std::size_t done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
             emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, offset);
+            emit_.patch_jump(done);
             return true;
         }
 
         if (base_in_rax) {
+            // same guard for a computed base pointer in RAX
+            emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            std::size_t done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
             emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, offset);
+            emit_.patch_jump(done);
         }
 
         return true;
@@ -12254,6 +12320,57 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         return true;
     }
 
+    // compile-time bounds check for a literal index into a known-size array/string.
+    // returns false (after raising a hard error) when the index is provably out of
+    // range, so a guaranteed fault becomes a build failure instead.
+    [[nodiscard]] bool check_literal_index_bounds(const ast::IndexExpr& idx, const Type& base_type) {
+        std::int64_t index = 0;
+        if (!try_get_i64_immediate(*idx.index, index)) {
+            return true;  // not a literal, cannot prove anything
+        }
+
+        std::optional<std::size_t> known_len;
+        if (auto* arr = std::get_if<ArrayType>(&base_type.kind); arr && arr->size) {
+            known_len = *arr->size;
+        } else if (idx.base->is<ast::IdentExpr>()) {
+            const std::string& name = idx.base->as<ast::IdentExpr>().name;
+            Symbol* sym = current_scope_->lookup(name);
+            if (sym && sym->array_len) {
+                known_len = sym->array_len;
+            } else if (!sym) {
+                // a single-use immutable binding is inlined rather than kept as a
+                // symbol; resolve it so its length is still known
+                const ast::Expr* inlined = current_scope_->lookup_inline(name);
+                if (inlined) {
+                    if (auto* lit = std::get_if<ast::LiteralExpr>(&inlined->kind)) {
+                        if (auto* s = std::get_if<std::string>(&lit->value)) {
+                            known_len = s->size();
+                        }
+                    } else if (auto* arr_lit = std::get_if<ast::ArrayExpr>(&inlined->kind)) {
+                        known_len = arr_lit->elements.size();
+                    }
+                }
+            }
+        } else if (idx.base->is<ast::ArrayExpr>()) {
+            known_len = idx.base->as<ast::ArrayExpr>().elements.size();
+        } else if (idx.base->is<ast::LiteralExpr>()) {
+            const auto& lit = idx.base->as<ast::LiteralExpr>();
+            if (auto* s = std::get_if<std::string>(&lit.value)) {
+                known_len = s->size();
+            }
+        }
+        if (!known_len) {
+            return true;
+        }
+
+        if (index < 0 || static_cast<std::uint64_t>(index) >= *known_len) {
+            error(std::format("index {} is out of bounds for array of length {}",
+                              index, *known_len));
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] bool generate_index(const ast::IndexExpr& idx) {
         auto base_type = infer_expr_type(*idx.base);
         std::optional<Type> elem_type;
@@ -12262,6 +12379,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         if (base_type) {
             auto resolved = canonicalize_type(*base_type);
             const Type& final_base = resolved ? *resolved : *base_type;
+            if (!check_literal_index_bounds(idx, final_base)) {
+                return false;
+            }
             if (auto* ptr = std::get_if<PointerType>(&final_base.kind)) {
                 elem_type = ptr->pointee->clone();
                 stride = typed_element_stride(*elem_type);
@@ -12283,7 +12403,32 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         if (!generate_expr(*idx.index)) return false;
 
         emit_.pop(x64::Reg::R11);
-        // guard the typed path only: a null base must not fault, yield a zero
+        // runtime bounds guard for a computed index into a known heap array: the
+        // length lives at [base-16] in native-image output. an out-of-range index
+        // reads 0 instead of faulting.
+        bool heap_guarded = false;
+        std::size_t heap_null_jump = 0;
+        std::size_t heap_oob_jump = 0;
+        if (is_native_image_output() && idx.base->is<ast::IdentExpr>()) {
+            Symbol* base_sym = current_scope_->lookup(idx.base->as<ast::IdentExpr>().name);
+            if (base_sym && base_sym->is_heap_array) {
+                // guard the null base first: [base-16] would fault on a null ptr
+                emit_.test(x64::Reg::R11, x64::Reg::R11);
+                std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
+                heap_null_jump = emit_.jmp_rel32_placeholder();
+                emit_.patch_jump(non_null);
+                // unsigned compare catches both negative and too-large indices,
+                // length lives at [base-16] in native-image output
+                emit_.cmp_mem(x64::Reg::RAX, x64::Reg::R11, -16);
+                std::size_t in_bounds = emit_.jcc_rel32(x64::Emitter::CC_B);
+                emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
+                heap_oob_jump = emit_.jmp_rel32_placeholder();
+                emit_.patch_jump(in_bounds);
+                heap_guarded = true;
+            }
+        }
+        // guard the typed path: a null base must not fault, yield a zero
         // element instead (base in R11, index in RAX after the pop)
         bool guarded = false;
         std::size_t guarded_done = 0;
@@ -12305,9 +12450,17 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             if (guarded) {
                 emit_.patch_jump(guarded_done);
             }
+            if (heap_guarded) {
+                emit_.patch_jump(heap_null_jump);
+                emit_.patch_jump(heap_oob_jump);
+            }
             return true;
         }
         emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, 0);
+        if (heap_guarded) {
+            emit_.patch_jump(heap_null_jump);
+            emit_.patch_jump(heap_oob_jump);
+        }
         return true;
     }
 
@@ -12893,11 +13046,23 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 } else if (stack_struct_locals_.contains(base_sym)) {
                     emit_.mov_store(x64::Reg::RBP, base_sym->stack_offset + offset, *value_reg);
                 } else {
+                    // a null struct pointer must not fault: skip the store
                     emit_.mov_load(x64::Reg::RAX, x64::Reg::RBP, base_sym->stack_offset);
+                    emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+                    std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                    std::size_t done = emit_.jmp_rel32_placeholder();
+                    emit_.patch_jump(non_null);
                     emit_.mov_store(x64::Reg::RAX, offset, *value_reg);
+                    emit_.patch_jump(done);
                 }
             } else {
+                // same guard for a computed base pointer in RAX
+                emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+                std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                std::size_t done = emit_.jmp_rel32_placeholder();
+                emit_.patch_jump(non_null);
                 emit_.mov_store(x64::Reg::RAX, offset, *value_reg);
+                emit_.patch_jump(done);
             }
             
             return true;
@@ -12933,6 +13098,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     error("cannot assign into immutable string index");
                     return false;
                 }
+                if (!check_literal_index_bounds(idx, final_base)) {
+                    return false;
+                }
                 if (auto* ptr = std::get_if<PointerType>(&final_base.kind)) {
                     elem_type = ptr->pointee->clone();
                     stride = typed_element_stride(*elem_type);
@@ -12951,6 +13119,28 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             emit_.pop(x64::Reg::R11);
             bool guarded = false;
             std::size_t guarded_done = 0;
+            bool heap_guarded = false;
+            std::size_t heap_null_jump = 0;
+            std::size_t heap_oob_jump = 0;
+            if (is_native_image_output() && idx.base->is<ast::IdentExpr>()) {
+                Symbol* base_sym = current_scope_->lookup(idx.base->as<ast::IdentExpr>().name);
+                if (base_sym && base_sym->is_heap_array) {
+                    // passive store: null base or an out-of-range index drops the
+                    // saved value and skips the write instead of faulting.
+                    // length lives at [base-16] in native-image output.
+                    emit_.test(x64::Reg::R11, x64::Reg::R11);
+                    std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                    emit_.add_imm(x64::Reg::RSP, 8);
+                    heap_null_jump = emit_.jmp_rel32_placeholder();
+                    emit_.patch_jump(non_null);
+                    emit_.cmp_mem(x64::Reg::RAX, x64::Reg::R11, -16);
+                    std::size_t in_bounds = emit_.jcc_rel32(x64::Emitter::CC_B);
+                    emit_.add_imm(x64::Reg::RSP, 8);
+                    heap_oob_jump = emit_.jmp_rel32_placeholder();
+                    emit_.patch_jump(in_bounds);
+                    heap_guarded = true;
+                }
+            }
             if (is_typed_raw && elem_type) {
                 // null base must not fault: ignore the store entirely
                 emit_.test(x64::Reg::R11, x64::Reg::R11);
@@ -12980,9 +13170,17 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 if (guarded) {
                     emit_.patch_jump(guarded_done);
                 }
+                if (heap_guarded) {
+                    emit_.patch_jump(heap_null_jump);
+                    emit_.patch_jump(heap_oob_jump);
+                }
                 return true;
             }
             emit_.mov_store(x64::Reg::R11, 0, x64::Reg::RAX);
+            if (heap_guarded) {
+                emit_.patch_jump(heap_null_jump);
+                emit_.patch_jump(heap_oob_jump);
+            }
             return true;
         }
 

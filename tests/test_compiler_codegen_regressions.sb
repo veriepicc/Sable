@@ -271,6 +271,37 @@ function int main() {
         return 30 + ng
     }
 
+    // 13: null struct pointers and computed out-of-range indices must not fault
+    let fg = test_null_field_and_oob_guards()
+    if fg != 0 {
+        return 40 + fg
+    }
+
+    return 0
+}
+
+struct NullGuardPoint {
+    x: int
+    y: int
+}
+
+function int test_null_field_and_oob_guards() {
+    // a null struct pointer: reads yield 0 instead of faulting
+    let p: *NullGuardPoint = 0 as *NullGuardPoint
+    if p.x != 0 { return 1 }
+    if p.y != 0 { return 2 }
+
+    // a computed index that runs off the end of a heap array must read 0
+    let arr = [10, 20, 30]
+    let big = 5000000
+    if arr[big] != 0 { return 3 }
+    let neg = 0 - 4
+    if arr[neg] != 0 { return 4 }
+
+    // in-range computed index still returns the real element
+    let i = 1
+    if arr[i] != 20 { return 5 }
+
     return 0
 }
 
