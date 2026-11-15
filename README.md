@@ -2,40 +2,40 @@
 
 ## Performance
 
-Up to **21.6× faster compilation** than MSVC · **5.0 KiB** smallest Sable executable.
+Up to **19.6× faster compilation** than MSVC · **5.0 KiB** smallest Sable executable.
 
 | Workload | Sable compile | Sable runtime | vs MSVC | vs GCC | vs TCC |
 | :--- | ---: | ---: | ---: | ---: | ---: |
-| math | 18.7 ms | **4.33 ms** | **4.6× faster** (19.71ms) | **1.3× faster** (5.72ms) | **24.9× faster** (107.64ms) |
-| state | 9.7 ms | **4.39 ms** | **5.1× faster** (22.32ms) | **1.3× faster** (5.82ms) | **14.7× faster** (64.69ms) |
-| branch | 9.2 ms | **4.64 ms** | **7.1× faster** (32.90ms) | **4.1× faster** (19.16ms) | **13.6× faster** (63.07ms) |
-| general | 9.6 ms | **24.00 ms** | 1.2× slower (19.59ms) | 1.6× slower (15.37ms) | **1.7× faster** (40.34ms) |
-| hft | 10.7 ms | **185.03 ms** | 1.5× slower (127.59ms) | 1.5× slower (120.37ms) | **1.4× faster** (266.32ms) |
-| math_vec | 9.7 ms | **47.37 ms** | **5.0× faster** (237.39ms) | **5.0× faster** (235.67ms) | **6.2× faster** (292.40ms) |
-| state_vec | 9.5 ms | **47.05 ms** | **7.8× faster** (367.48ms) | **7.6× faster** (355.66ms) | **11.0× faster** (517.95ms) |
-| branch_vec | 11.4 ms | **48.07 ms** | **5.0× faster** (240.68ms) | **4.9× faster** (236.21ms) | **6.5× faster** (311.59ms) |
-| general_vec | 9.9 ms | **26.28 ms** | **7.0× faster** (185.10ms) | **6.8× faster** (179.70ms) | **9.1× faster** (238.86ms) |
-| hft_vec | 9.8 ms | **27.00 ms** | **6.6× faster** (179.04ms) | **6.7× faster** (180.17ms) | **8.6× faster** (233.16ms) |
+| math | 17.8 ms | **4.47 ms** | **7.0× faster** (31.48ms) | **1.3× faster** (5.59ms) | **29.4× faster** (131.22ms) |
+| state | 9.4 ms | **4.42 ms** | **4.9× faster** (21.56ms) | **1.3× faster** (5.54ms) | **19.2× faster** (84.68ms) |
+| branch | 9.3 ms | **4.25 ms** | **7.3× faster** (30.86ms) | **4.7× faster** (19.84ms) | **12.0× faster** (51.15ms) |
+| general | 9.6 ms | **23.48 ms** | 1.2× slower (18.90ms) | 1.2× slower (19.43ms) | **2.0× faster** (47.96ms) |
+| hft | 10.1 ms | **190.94 ms** | 1.3× slower (141.44ms) | 1.5× slower (131.35ms) | **2.1× faster** (400.73ms) |
+| math_vec | 9.5 ms | **45.41 ms** | **2.9× faster** (131.14ms) | **2.9× faster** (132.33ms) | **4.7× faster** (211.42ms) |
+| state_vec | 10.4 ms | **45.74 ms** | **4.2× faster** (192.00ms) | **4.4× faster** (199.35ms) | **7.6× faster** (346.21ms) |
+| branch_vec | 9.4 ms | **45.67 ms** | **3.1× faster** (142.87ms) | **2.9× faster** (133.67ms) | **5.3× faster** (239.88ms) |
+| general_vec | 10.8 ms | **24.56 ms** | **4.3× faster** (104.52ms) | **4.1× faster** (101.84ms) | **7.8× faster** (190.47ms) |
+| hft_vec | 9.5 ms | **25.08 ms** | **4.2× faster** (105.22ms) | **4.1× faster** (102.30ms) | **7.6× faster** (191.59ms) |
 
 Windows AMD64 · 5 measured runs · 2 warmups · minimum runtime.
 [Full results & methodology](BENCHMARKS.md)
 
-[Benchmark CI run](https://github.com/veriepicc/Sable/actions/runs/43717497981) · Source: `2fb45a7057a6`.
+[Benchmark CI run](https://github.com/veriepicc/Sable/actions/runs/43717993123) · Source: `c542d5a8aab3`.
 
 
 ## Core CI Build Status
 
 | Host & Toolchain | Target | Configuration | Build |
 | :--- | :---: | :---: | :---: |
-| Windows Server 2022 · MSVC | x64 | Release | [Passed](https://github.com/veriepicc/Sable/actions/runs/43717497981) |
+| Windows Server 2022 · MSVC | x64 | Release | [Passed](https://github.com/veriepicc/Sable/actions/runs/43717993123) |
 
 ## Platform CI Test Status
 
 | Test Host | Execution | Passed | Failed | Skipped | Result |
 | :--- | :--- | ---: | ---: | ---: | :---: |
-| Windows Server 2022 | Native x64 | — | — | — | [No report](https://github.com/veriepicc/Sable/actions/runs/43717497981) |
-| Windows Server 2025 | Native x64 | — | — | — | [No report](https://github.com/veriepicc/Sable/actions/runs/43717497981) |
-| Windows 11 on Arm | x64 emulation | — | — | — | [No report](https://github.com/veriepicc/Sable/actions/runs/43717497981) |
-| Ubuntu 24.04 | Wine x64 | — | — | — | [No report](https://github.com/veriepicc/Sable/actions/runs/43717497981) |
+| Windows Server 2022 | Native x64 | — | — | — | [No report](https://github.com/veriepicc/Sable/actions/runs/43717993123) |
+| Windows Server 2025 | Native x64 | — | — | — | [No report](https://github.com/veriepicc/Sable/actions/runs/43717993123) |
+| Windows 11 on Arm | x64 emulation | — | — | — | [No report](https://github.com/veriepicc/Sable/actions/runs/43717993123) |
+| Ubuntu 24.04 | Wine x64 | — | — | — | [No report](https://github.com/veriepicc/Sable/actions/runs/43717993123) |
 
-Results: [CI run](https://github.com/veriepicc/Sable/actions/runs/43717497981) · Source: `2fb45a7057a6`.
+Results: [CI run](https://github.com/veriepicc/Sable/actions/runs/43717993123) · Source: `c542d5a8aab3`.
