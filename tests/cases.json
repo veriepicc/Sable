@@ -1823,5 +1823,71 @@
     "Name": "invalid_str_index_oob",
     "File": "tests/invalid_str_index_oob.sb",
     "ExpectedErrorContains": "out of bounds"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_dup_struct_field",
+    "File": "tests/invalid_dup_struct_field.sb",
+    "ExpectedErrorContains": "more than once"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_dup_enum_variant",
+    "File": "tests/invalid_dup_enum_variant.sb",
+    "ExpectedErrorContains": "more than once"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_dup_parameter",
+    "File": "tests/invalid_dup_parameter.sb",
+    "ExpectedErrorContains": "more than once"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_deref_non_pointer",
+    "File": "tests/invalid_deref_non_pointer.sb",
+    "ExpectedErrorContains": "cannot dereference"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_index_float",
+    "File": "tests/invalid_index_float.sb",
+    "ExpectedErrorContains": "cannot index a value"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_struct_missing_field",
+    "File": "tests/invalid_struct_missing_field.sb",
+    "ExpectedErrorContains": "missing field"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_cast_unknown_type",
+    "File": "tests/invalid_cast_unknown_type.sb",
+    "ExpectedErrorContains": "unknown cast target type"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_mod_float",
+    "File": "tests/invalid_mod_float.sb",
+    "ExpectedErrorContains": "requires an integer operand"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_shift_negative",
+    "File": "tests/invalid_shift_negative.sb",
+    "ExpectedErrorContains": "shift count"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_return_value_from_void",
+    "File": "tests/invalid_return_value_from_void.sb",
+    "ExpectedErrorContains": "no return type"
+  },
+  {
+    "kind": "reject",
+    "Name": "invalid_return_bare_from_value",
+    "File": "tests/invalid_return_bare_from_value.sb",
+    "ExpectedErrorContains": "return with no value"
   }
 ]

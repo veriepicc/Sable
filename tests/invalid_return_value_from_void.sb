@@ -1,0 +1,9 @@
+// returning a value from a void function discards it silently
+function void nothing() {
+    return 1
+}
+
+function int main() {
+    nothing()
+    return 0
+}

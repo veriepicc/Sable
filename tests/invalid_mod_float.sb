@@ -1,0 +1,9 @@
+// integer modulo on a float operand is not defined
+function int use(int v) {
+    return v
+}
+
+function int main() {
+    let a = 5.5 % 2
+    return use(a)
+}

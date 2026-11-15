@@ -1,0 +1,9 @@
+// a struct field declared twice is a diagnostic, not a silent same-offset overwrite
+struct DupField {
+    x: int,
+    x: int
+}
+
+function int main() {
+    return 0
+}

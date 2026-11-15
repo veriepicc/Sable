@@ -1,0 +1,9 @@
+// indexing a float value is never valid
+function int use(int v) {
+    return v
+}
+
+function int main() {
+    let a = 5.5
+    return use(a[0])
+}

@@ -1,0 +1,6 @@
+// an enum variant declared twice would silently share a value
+enum DupVariant { A, B, A }
+
+function int main() {
+    return 0
+}

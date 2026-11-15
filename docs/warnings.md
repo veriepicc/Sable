@@ -46,6 +46,16 @@ Rules:
 | `-Wloop-never-runs` | a literal `range(a, b)` with `a >= b` can never iterate |
 | `-Wduplicate-switch-case` | the same `case` value appears twice |
 | `-Wunreachable-switch-case` | a `case` appears after the default `else` |
+| `-Wunused-decl` | a top-level function/struct/view/class/enum/constant/global is never referenced |
+| `-Wshift-count` | a shift count is negative or `>= 64` |
+| `-Wcomparison-always-true` | a comparison folds to a constant (both sides are constants) |
+| `-Wduplicate-condition` | a branch of an `if`/`else if` chain repeats an earlier condition |
+| `-Wshadowed-parameter` | a local binding shadows an enclosing parameter |
+| `-Wunused-loop-var` | a `for`/`parallel for` loop variable is never read |
+| `-Wdiv-by-zero-const` | division/modulo by a constant expression that folds to zero |
+| `-Wvoid-value-used` | the result of a `void` call is bound to a value |
+| `-Wredundant-cast` | a literal is cast to the type it already has |
+| `-Wassign-in-condition` | an assignment is used as an `if`/`while` condition |
 
 Names starting with `_` are treated as intentionally unused, so `_buf` never
 triggers `unused-local` and a `_`-prefixed or `self` parameter never triggers
@@ -91,6 +101,17 @@ Some conditions are always bugs and are rejected outright, not warned about:
   variable
 - revisiting an already-freed binding (use-after-free), double free
 - calling a builtin with the wrong number of arguments
+- a struct / view / class field declared more than once
+- an enum variant declared more than once
+- a function or method parameter name used more than once
+- a struct literal that omits a declared field, or sets one twice
+- dereferencing a value whose static type is an integer / float / void
+- indexing a value whose static type is a float / bool / void / struct
+- casting to a type name that resolves to no known type
+- integer modulo (`%`) on a float operand
+- a negative literal shift count
+- returning a value from a `void` function, or a bare `return` from a function
+  that must produce a value, or returning the result of a `void` call
 
 ## Runtime guards
 

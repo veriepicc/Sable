@@ -35,6 +35,16 @@ enum class WarningKind : std::uint8_t {
     ComparisonOfBoolToInt, // bool compared against a numeric literal
     EmptyFunctionBody,     // function with an empty body
     LoopNeverRuns,         // for range(a, b) with a >= b and both literal
+    UnusedDecl,            // function/struct/class/view/enum/const/static never referenced
+    ShiftCount,            // shift amount is a negative or >= 64 literal (well-defined mask/0 result)
+    ComparisonAlwaysTrue,  // comparison of a literal against itself, or identical operands
+    DuplicateCondition,    // same condition tested twice in one if/else chain
+    ShadowedParameter,     // local binding shadows an enclosing parameter
+    UnusedLoopVariable,    // for/parallel-for loop variable never read
+    DivByZeroConst,        // division/modulo by a constant expression that evaluates to zero
+    VoidValueUsed,         // value of a void call consumed as an expression
+    RedundantCast,         // cast of a literal to its own type
+    AssignInCondition,     // assignment used as a condition (if x = 1)
     Count,
 };
 
@@ -55,6 +65,16 @@ enum class WarningKind : std::uint8_t {
         case WarningKind::ComparisonOfBoolToInt: return "bool-int-compare";
         case WarningKind::EmptyFunctionBody:     return "empty-function";
         case WarningKind::LoopNeverRuns:         return "loop-never-runs";
+        case WarningKind::UnusedDecl:            return "unused-decl";
+        case WarningKind::ShiftCount:            return "shift-count";
+        case WarningKind::ComparisonAlwaysTrue:  return "comparison-always-true";
+        case WarningKind::DuplicateCondition:    return "duplicate-condition";
+        case WarningKind::ShadowedParameter:     return "shadowed-parameter";
+        case WarningKind::UnusedLoopVariable:    return "unused-loop-var";
+        case WarningKind::DivByZeroConst:        return "div-by-zero-const";
+        case WarningKind::VoidValueUsed:         return "void-value-used";
+        case WarningKind::RedundantCast:         return "redundant-cast";
+        case WarningKind::AssignInCondition:     return "assign-in-condition";
         case WarningKind::Count:                 break;
     }
     return "unknown";
@@ -78,6 +98,16 @@ enum class WarningKind : std::uint8_t {
         case WarningKind::ComparisonOfBoolToInt: return "bool compared against an integer literal";
         case WarningKind::EmptyFunctionBody:     return "function body is empty";
         case WarningKind::LoopNeverRuns:         return "literal range makes the loop dead";
+        case WarningKind::UnusedDecl:            return "declaration is never referenced";
+        case WarningKind::ShiftCount:            return "shift amount is negative or >= width";
+        case WarningKind::ComparisonAlwaysTrue:  return "comparison always yields the same result";
+        case WarningKind::DuplicateCondition:    return "condition repeats an earlier branch";
+        case WarningKind::ShadowedParameter:     return "binding shadows an enclosing parameter";
+        case WarningKind::UnusedLoopVariable:    return "loop variable is never read";
+        case WarningKind::DivByZeroConst:        return "division by a constant zero";
+        case WarningKind::VoidValueUsed:         return "void call result is consumed";
+        case WarningKind::RedundantCast:         return "cast to the value's own type";
+        case WarningKind::AssignInCondition:     return "assignment used as a condition";
         case WarningKind::Count:                 break;
     }
     return "";
@@ -184,21 +214,22 @@ public:
         for (const auto& decl : module.decls) {
             analyze_decl(*decl, decl->span);
         }
-        // pass 2: walk function bodies (imports are marked used here)
+        // pass 2: walk declarations (types/imports are marked used here)
         for (const auto& decl : module.decls) {
-            if (decl->is<ast::FnDecl>()) {
-                analyze_fn(decl->as<ast::FnDecl>(), decl->span);
-            } else if (decl->is<ast::ClassDecl>()) {
-                for (const auto& m : decl->as<ast::ClassDecl>().methods) {
-                    analyze_fn_body(m.name, m.params, m.body, decl->span);
-                }
-            }
+            analyze_decl_body(*decl, decl->span);
         }
         // report unused imports
         for (const auto& [name, b] : import_bindings_) {
             if (!b.used) {
                 report(WarningKind::UnusedImport, b.span,
                        std::format("import '{}' is never used", b.path));
+            }
+        }
+        // report unreferenced top-level declarations
+        for (const auto& [name, b] : declared_names_) {
+            if (!b.used) {
+                report(WarningKind::UnusedDecl, b.span,
+                       std::format("{} '{}' is never referenced", b.kind, name));
             }
         }
         WarningResult result;
@@ -267,7 +298,9 @@ private:
                            std::format("unused parameter '{}'", name));
                     break;
                 case BindingKind::LoopVar:
-                    break; // loop variables are frequently intentional, skip
+                    report(WarningKind::UnusedLoopVariable, b.span,
+                           std::format("unused loop variable '{}'", name));
+                    break;
             }
         }
         scope_ = scope_->parent;
@@ -276,6 +309,11 @@ private:
     void mark_used(const std::string& name) {
         if (auto it = import_bindings_.find(name); it != import_bindings_.end()) {
             it->second.used = true;
+        }
+        if (auto it = declared_names_.find(name); it != declared_names_.end()) {
+            if (name != current_decl_name_) {
+                it->second.used = true;
+            }
         }
         for (Scope* s = scope_; s != nullptr; s = s->parent) {
             if (auto it = s->bindings.find(name); it != s->bindings.end()) {
@@ -342,6 +380,19 @@ private:
     // imports seen, keyed by the bound name
     struct ImportBinding { std::string bound_name; std::string path; SourceSpan span{}; bool used = false; };
     std::unordered_map<std::string, ImportBinding> import_bindings_;
+    // top-level declarations, keyed by name (unused-decl)
+    struct DeclBinding { std::string kind; SourceSpan span{}; bool used = false; };
+    std::unordered_map<std::string, DeclBinding> declared_names_;
+    // names of functions/methods that return void, so a value binding from them can
+    // be flagged
+    std::unordered_set<std::string> void_functions_;
+    // name of the top-level declaration whose body is being walked; a reference to
+    // it from inside itself (self-recursion) is not counted as an external use.
+    std::string current_decl_name_;
+    // parameter names of the function currently being analyzed (shadowed-parameter)
+    std::unordered_set<std::string> param_names_;
+    // integer values of top-level constants, so a divisor like `TEN` can be folded
+    std::unordered_map<std::string, std::int64_t> const_int_values_;
 
     void analyze_decl(const ast::Decl& decl, const SourceSpan& decl_span) {
         std::visit(detail::overloaded{
@@ -353,8 +404,45 @@ private:
                 b.span = decl_span;
                 import_bindings_[bound] = std::move(b);
             },
+            [&](const ast::FnDecl& f) {
+                mark_decl("function", f.name, decl_span, f.attrs);
+                if (f.return_type.is_void()) {
+                    void_functions_.insert(f.name);
+                }
+            },
+            [&](const ast::StructDecl& s) {
+                mark_decl("struct", s.name, decl_span, s.attrs);
+            },
+            [&](const ast::ViewDecl& v) {
+                mark_decl("view", v.name, decl_span, v.attrs);
+            },
+            [&](const ast::ClassDecl& c) {
+                mark_decl("class", c.name, decl_span, c.attrs);
+            },
+            [&](const ast::EnumDecl& e) {
+                mark_decl("enum", e.name, decl_span, e.attrs);
+            },
+            [&](const ast::ConstDecl& c) {
+                mark_decl("constant", c.name, decl_span, c.attrs);
+                std::int64_t value = 0;
+                if (c.value && try_literal_i64(*c.value, value)) {
+                    const_int_values_.insert_or_assign(c.name, value);
+                }
+            },
+            [&](const ast::StaticDecl& s) {
+                mark_decl("global", s.name, decl_span, s.attrs);
+            },
             [&](const auto&) {},
         }, decl.kind);
+    }
+
+    void mark_decl(std::string_view kind, const std::string& name, const SourceSpan& span,
+                   const ast::DeclAttrs& attrs) {
+        if (name.starts_with("_") || name == "main" || attrs.is_extern()) {
+            return;
+        }
+        declared_names_.insert_or_assign(
+            name, DeclBinding{.kind = std::string(kind), .span = span, .used = false});
     }
 
     static std::string last_path_component(const std::string& path) {
@@ -364,11 +452,74 @@ private:
         return path;
     }
 
+    // mark a declared type name (and any named type nested inside it) as used, so
+    // a struct/view/enum referenced only from a type annotation is not reported
+    // as an unused declaration.
+    void mark_type_used(const Type& type) {
+        std::visit(detail::overloaded{
+            [&](const ArrayType& a) { if (a.element) mark_type_used(*a.element); },
+            [&](const PointerType& p) { if (p.pointee) mark_type_used(*p.pointee); },
+            [&](const StructType& s) {
+                for (const auto& [_, t] : s.fields) {
+                    if (t) mark_type_used(*t);
+                }
+            },
+            [&](const FunctionType& f) {
+                for (const auto& p : f.params) {
+                    if (p) mark_type_used(*p);
+                }
+                if (f.ret) mark_type_used(*f.ret);
+            },
+            [&](const std::string& name) {
+                if (auto it = declared_names_.find(name); it != declared_names_.end()) {
+                    it->second.used = true;
+                }
+            },
+            [&](const auto&) {},
+        }, type.kind);
+    }
+
     void analyze_fn(const ast::FnDecl& fn, const SourceSpan& decl_span) {
         if (!fn.has_body()) {
             return;
         }
         analyze_fn_body(fn.name, fn.params, fn.body_ref(), decl_span);
+    }
+
+    // pass-2 walk of a top-level declaration: mark referenced types, build the
+    // set of parameter names (for shadowed-parameter), then analyze the body.
+    void analyze_decl_body(const ast::Decl& decl, const SourceSpan& decl_span) {
+        std::string saved_decl = current_decl_name_;
+        std::visit(detail::overloaded{
+            [&](const ast::FnDecl& f) {
+                current_decl_name_ = f.name;
+                mark_type_used(f.return_type);
+                for (const auto& p : f.params) mark_type_used(p.type);
+                analyze_fn(f, decl_span);
+            },
+            [&](const ast::StructDecl& s) {
+                current_decl_name_ = s.name;
+                for (const auto& fld : s.fields) mark_type_used(fld.type);
+            },
+            [&](const ast::ViewDecl& v) {
+                current_decl_name_ = v.name;
+                for (const auto& fld : v.fields) mark_type_used(fld.type);
+            },
+            [&](const ast::ClassDecl& c) {
+                current_decl_name_ = c.name;
+                for (const auto& fld : c.fields) mark_type_used(fld.type);
+                for (const auto& m : c.methods) {
+                    mark_type_used(m.return_type);
+                    for (const auto& p : m.params) mark_type_used(p.type);
+                    analyze_fn_body(m.name, m.params, m.body, decl_span);
+                }
+            },
+            [&](const ast::ConstDecl& c) { mark_type_used(c.type); },
+            [&](const ast::StaticDecl& s) { mark_type_used(s.type); },
+            [&](const ast::TypeAliasDecl& t) { mark_type_used(t.target); },
+            [&](const auto&) {},
+        }, decl.kind);
+        current_decl_name_ = std::move(saved_decl);
     }
 
     void analyze_fn_body(const std::string& name, const ast::ParamList& params,
@@ -380,6 +531,8 @@ private:
         }
         SourceSpan saved_fallback = fallback_span_;
         fallback_span_ = fn_span;
+        auto saved_params = std::move(param_names_);
+        param_names_.clear();
         push_scope();
         for (const auto& p : params) {
             Binding b;
@@ -391,9 +544,11 @@ private:
                 b.is_bool = (*prim == PrimitiveType::Bool);
             }
             scope_->bindings[p.name] = b;
+            param_names_.insert(p.name);
         }
         analyze_suite(body);
         pop_scope(); // reports unused parameters
+        param_names_ = std::move(saved_params);
         fallback_span_ = saved_fallback;
     }
 
@@ -439,6 +594,7 @@ private:
             [&](const ast::WhileStmt& s) {
                 if (s.condition) {
                     analyze_expr(*s.condition);
+                    check_condition_expr(*s.condition, stmt_span);
                     if (is_literal_expr(*s.condition)) {
                         report(WarningKind::ConstCondition, stmt_span,
                                "while condition is a constant; loop never or always runs");
@@ -493,6 +649,7 @@ private:
     }
 
     void analyze_let(const ast::LetStmt& s, const SourceSpan& span) {
+        bool shadows_param = param_names_.contains(s.name);
         for (Scope* p = scope_->parent; p != nullptr; p = p->parent) {
             if (auto it = p->bindings.find(s.name); it != p->bindings.end()) {
                 report(WarningKind::ShadowedVariable, span,
@@ -500,10 +657,23 @@ private:
                 break;
             }
         }
+        if (shadows_param) {
+            report(WarningKind::ShadowedParameter, span,
+                   std::format("'{}' shadows a parameter", s.name));
+        }
 
         if (s.init) {
             analyze_expr(*s.init);
             check_implicit_narrowing(*s.init, s.type, span, s.name);
+            if (!s.type) {
+                if (auto* call = std::get_if<ast::CallExpr>(&s.init->kind);
+                    call && call->callee && call->callee->is<ast::IdentExpr>() &&
+                    void_functions_.contains(call->callee->as<ast::IdentExpr>().name)) {
+                    report(WarningKind::VoidValueUsed, span,
+                           std::format("'{}' binds the result of '{}', which returns void",
+                                       s.name, call->callee->as<ast::IdentExpr>().name));
+                }
+            }
         }
         declare(s.name, span, BindingKind::Let);
         // remember whether this binding is a bool, for bool-int-compare
@@ -524,10 +694,36 @@ private:
     }
 
     void analyze_if(const ast::IfStmt& s, const SourceSpan& span) {
+        std::vector<std::string> conditions;
+        analyze_if_chain(s, span, conditions);
+    }
+
+    // walks an if / else-if / else chain, reporting a branch whose condition
+    // duplicates an earlier one in the same chain.
+    // shared condition checks used by if / while / for-condition sites
+    void check_condition_expr(const ast::Expr& cond, const SourceSpan& span) {
+        if (auto* bin = std::get_if<ast::BinaryExpr>(&cond.kind)) {
+            if (bin->op == ast::BinaryExpr::Op::Assign) {
+                report(WarningKind::AssignInCondition, span,
+                       "assignment ('=') used as a condition; did you mean '=='?");
+            }
+        }
+    }
+
+    void analyze_if_chain(const ast::IfStmt& s, const SourceSpan& span,
+                          std::vector<std::string>& seen) {
         if (s.condition) {
             analyze_expr(*s.condition);
+            check_condition_expr(*s.condition, span);
             if (is_literal_expr(*s.condition)) {
                 report(WarningKind::ConstCondition, span, "if condition is a constant");
+            } else if (auto key = condition_key(*s.condition)) {
+                if (std::find(seen.begin(), seen.end(), *key) != seen.end()) {
+                    report(WarningKind::DuplicateCondition, span,
+                           std::format("condition '{}' was already tested in this chain", *key));
+                } else {
+                    seen.push_back(*key);
+                }
             }
         }
         if (s.then_block.stmts.empty() && !s.has_else()) {
@@ -537,10 +733,52 @@ private:
         analyze_suite(s.then_block);
         pop_scope();
         if (s.has_else()) {
-            push_scope();
-            analyze_suite(*s.else_block);
-            pop_scope();
+            // an `else if` is represented as an else block holding a single IfStmt;
+            // continue the chain so duplicate conditions across it are caught.
+            if (s.else_block->stmts.size() == 1 && s.else_block->stmts[0]->is<ast::IfStmt>()) {
+                analyze_if_chain(s.else_block->stmts[0]->as<ast::IfStmt>(),
+                                 s.else_block->stmts[0]->span, seen);
+            } else {
+                push_scope();
+                analyze_suite(*s.else_block);
+                pop_scope();
+            }
         }
+    }
+
+    // a stable textual key for a simple condition, or nullopt when the expression
+    // is too complex to compare reliably.
+    [[nodiscard]] static std::optional<std::string> condition_key(const ast::Expr& expr) {
+        if (auto* id = std::get_if<ast::IdentExpr>(&expr.kind)) {
+            return "id:" + id->name;
+        }
+        if (auto* lit = std::get_if<ast::LiteralExpr>(&expr.kind)) {
+            if (auto* i = std::get_if<std::int64_t>(&lit->value)) return "lit:" + std::to_string(*i);
+            if (auto* u = std::get_if<std::uint64_t>(&lit->value)) return "lit:" + std::to_string(*u);
+            if (auto* b = std::get_if<bool>(&lit->value)) return std::string("lit:") + (*b ? "true" : "false");
+            if (auto* c = std::get_if<char32_t>(&lit->value)) return "lit:" + std::to_string(static_cast<std::int64_t>(*c));
+            return std::nullopt;
+        }
+        if (auto* f = std::get_if<ast::FieldExpr>(&expr.kind)) {
+            if (!f->base) return std::nullopt;
+            auto base = condition_key(*f->base);
+            if (!base) return std::nullopt;
+            return "field:" + *base + "." + f->field;
+        }
+        if (auto* b = std::get_if<ast::BinaryExpr>(&expr.kind)) {
+            if (!b->lhs || !b->rhs) return std::nullopt;
+            auto l = condition_key(*b->lhs);
+            auto r = condition_key(*b->rhs);
+            if (!l || !r) return std::nullopt;
+            return std::format("bin:{}|{}|{}", static_cast<int>(b->op), *l, *r);
+        }
+        if (auto* u = std::get_if<ast::UnaryExpr>(&expr.kind)) {
+            if (!u->operand) return std::nullopt;
+            auto inner = condition_key(*u->operand);
+            if (!inner) return std::nullopt;
+            return std::format("un:{}|{}", static_cast<int>(u->op), *inner);
+        }
+        return std::nullopt;
     }
 
     void analyze_switch(const ast::SwitchStmt& s, const SourceSpan& span) {
@@ -604,9 +842,25 @@ private:
                 if (e.base) analyze_expr(*e.base);
                 if (e.index) analyze_expr(*e.index);
             },
-            [&](const ast::FieldExpr& e) { if (e.base) analyze_expr(*e.base); },
+            [&](const ast::FieldExpr& e) {
+                if (e.base) analyze_expr(*e.base);
+                // a field access resolves the name through the struct registry, never
+                // as a top-level decl, so it must not keep a same-named decl alive.
+            },
             [&](const ast::CastExpr& e) {
                 if (e.expr) analyze_expr(*e.expr);
+                // cast of a literal to the type it already has
+                if (e.expr) {
+                    if (auto* lit = std::get_if<ast::LiteralExpr>(&e.expr->kind)) {
+                        auto* lp = std::get_if<PrimitiveType>(&e.target_type.kind);
+                        auto* sp = std::get_if<PrimitiveType>(&lit->type.kind);
+                        if (lp && sp && *lp == *sp) {
+                            report(WarningKind::RedundantCast, expr.span,
+                                   std::format("cast to '{}' is redundant; the literal is already that type",
+                                               std::string(primitive_name(*lp))));
+                        }
+                    }
+                }
             },
             [&](const ast::FStringExpr& e) {
                 for (const auto& part : e.parts) {
@@ -679,6 +933,7 @@ private:
                 out = static_cast<std::int64_t>(*u);
                 return true;
             }
+            if (auto* b = std::get_if<bool>(&lit->value)) { out = *b ? 1 : 0; return true; }
         }
         if (auto* un = std::get_if<ast::UnaryExpr>(&expr.kind);
             un && un->op == ast::UnaryExpr::Op::Neg && un->operand) {
@@ -686,6 +941,33 @@ private:
             if (try_literal_i64(*un->operand, inner)) { out = -inner; return true; }
         }
         return false;
+    }
+
+    // fold a constant integer expression: literals, named constants, and + - * of
+    // foldable operands. used to catch division/modulo by a constant zero.
+    [[nodiscard]] bool try_const_i64(const ast::Expr& expr, std::int64_t& out) const {
+        if (try_literal_i64(expr, out)) {
+            return true;
+        }
+        if (auto* id = std::get_if<ast::IdentExpr>(&expr.kind)) {
+            if (auto it = const_int_values_.find(id->name); it != const_int_values_.end()) {
+                out = it->second;
+                return true;
+            }
+            return false;
+        }
+        auto* b = std::get_if<ast::BinaryExpr>(&expr.kind);
+        if (!b || !b->lhs || !b->rhs) return false;
+        std::int64_t l = 0;
+        std::int64_t r = 0;
+        if (!try_const_i64(*b->lhs, l) || !try_const_i64(*b->rhs, r)) return false;
+        switch (b->op) {
+            case ast::BinaryExpr::Op::Add: out = l + r; return true;
+            case ast::BinaryExpr::Op::Sub: out = l - r; return true;
+            case ast::BinaryExpr::Op::Mul: out = l * r; return true;
+            case ast::BinaryExpr::Op::Shl: out = (r >= 0 && r < 64) ? (l << r) : 0; return true;
+            default: return false;
+        }
     }
 
     void analyze_binary(const ast::BinaryExpr& e, const SourceSpan& span) {
@@ -751,6 +1033,46 @@ private:
                     default:
                         break;
                 }
+            }
+        }
+
+        // comparison of two distinct identifiers that never change between them is
+        // not provable, but a comparison of the SAME literal on both sides is: e.g.
+        // 3 == 3. also catches the degenerate `<`/`>` of equal literals (always false).
+        if (e.lhs && e.rhs) {
+            const bool cmp = e.op == Op::Eq || e.op == Op::Ne || e.op == Op::Lt ||
+                             e.op == Op::Gt || e.op == Op::Le || e.op == Op::Ge;
+            if (cmp) {
+                std::int64_t l = 0;
+                std::int64_t r = 0;
+                const bool l_const = try_const_i64(*e.lhs, l);
+                const bool r_const = try_const_i64(*e.rhs, r);
+                if (l_const && r_const && !(e.lhs->is<ast::IdentExpr>() && e.rhs->is<ast::IdentExpr>())) {
+                    report(WarningKind::ComparisonAlwaysTrue, span,
+                           std::format("comparison of two constants ({} vs {}) is always the same result", l, r));
+                }
+            }
+        }
+
+        // shift by a negative or >= 64 literal count (only variable shifts actually
+        // mask; a literal count this large is almost always a bug)
+        if ((e.op == Op::Shl || e.op == Op::Shr) && e.rhs) {
+            std::int64_t count = 0;
+            if (try_const_i64(*e.rhs, count) && (count < 0 || count >= 64)) {
+                report(WarningKind::ShiftCount, span,
+                       std::format("shift count {} is outside 0..63; the result is 0 or masked",
+                                   count));
+            }
+        }
+
+        // division / modulo by a constant expression that folds to zero. the literal
+        // case is a hard error in codegen; a named constant or folded expr reaches
+        // codegen as a non-literal and would fault at runtime, so warn here.
+        if ((e.op == Op::Div || e.op == Op::Mod) && e.rhs) {
+            std::int64_t divisor = 0;
+            if (try_const_i64(*e.rhs, divisor) && divisor == 0) {
+                report(WarningKind::DivByZeroConst, span,
+                       "division/modulo by a constant that evaluates to zero");
             }
         }
     }

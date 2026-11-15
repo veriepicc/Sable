@@ -268,6 +268,7 @@ public:
             } else if (decl->is<ast::FnDecl>()) {
                 const auto& fn = decl->as<ast::FnDecl>();
                 if (!claim_symbol_name(function_owners_, "function", fn.name, current_symbol_owner())) return false;
+                if (!check_duplicate_params("function", fn.name, fn.params)) return false;
                 if (!register_resolved_fn_support(fn)) return false;
                 auto resolved_ret = resolve_fn_decl_return_type(fn);
                 if (!resolved_ret) return false;
@@ -2470,6 +2471,36 @@ private:
         return false;
     }
 
+    // human-readable name for a type, used in diagnostics
+    [[nodiscard]] static std::string type_display_name(const Type& type) {
+        return std::visit(overloaded{
+            [](PrimitiveType p) { return std::string(primitive_name(p)); },
+            [](const PointerType& p) {
+                return std::string("*") + (p.pointee ? type_display_name(*p.pointee) : std::string("?"));
+            },
+            [](const std::string& name) { return name; },
+            [](const StructType& s) { return s.name; },
+            [](const ArrayType& a) {
+                return (a.element ? type_display_name(*a.element) : std::string("?")) + "[]";
+            },
+            [](const FunctionType&) { return std::string("fn"); },
+        }, type.kind);
+    }
+
+    // reject two parameters sharing a name: the second silently shadows the first,
+    // so the body always reads one of them and the other is dead.
+    [[nodiscard]] bool check_duplicate_params(std::string_view kind, const std::string& name,
+                                              const ast::ParamList& params) {
+        std::unordered_set<std::string> seen;
+        for (const auto& p : params) {
+            if (!seen.insert(p.name).second) {
+                error(std::format("{} '{}' declares parameter '{}' more than once", kind, name, p.name));
+                return false;
+            }
+        }
+        return true;
+    }
+
     std::string display_module_path(std::string_view canonical) const {
         std::filesystem::path path(canonical);
         if (!project_root_.empty()) {
@@ -3617,10 +3648,17 @@ private:
         StructInfo info;
         info.name = s.name;
         for (const auto& [name, type] : s.fields) {
+            if (info.field_offsets.contains(name)) {
+                error(std::format("struct '{}' declares field '{}' more than once", s.name, name));
+                return false;
+            }
             auto resolved = canonicalize_type(type);
             if (!resolved) return false;
             info.fields.emplace_back(name, std::move(*resolved));
+            // reserve the slot now so a later duplicate is detected
+            info.field_offsets[name] = info.fields.size() - 1;
         }
+        info.field_offsets.clear();
         info.calculate_offsets();
         structs_[s.name] = std::move(info);
         return true;
@@ -3633,6 +3671,10 @@ private:
         info.name = v.name;
         info.is_view = true;
         for (const auto& field : v.fields) {
+            if (info.field_offsets.contains(field.name)) {
+                error(std::format("view '{}' declares field '{}' more than once", v.name, field.name));
+                return false;
+            }
             auto resolved = canonicalize_type(field.type);
             if (!resolved) return false;
             auto offset_opt = resolve_view_field_offset(field);
@@ -3662,10 +3704,16 @@ private:
         StructInfo info;
         info.name = c.name;
         for (const auto& [name, type] : c.fields) {
+            if (info.field_offsets.contains(name)) {
+                error(std::format("class '{}' declares field '{}' more than once", c.name, name));
+                return false;
+            }
             auto resolved = canonicalize_type(type);
             if (!resolved) return false;
             info.fields.emplace_back(name, std::move(*resolved));
+            info.field_offsets[name] = info.fields.size() - 1;
         }
+        info.field_offsets.clear();
         info.calculate_offsets();
         structs_[c.name] = std::move(info);
         
@@ -3796,6 +3844,10 @@ private:
         std::unordered_map<std::string, std::int64_t> variants;
         std::int64_t next_value = 0;
         for (const auto& [name, value] : e.variants) {
+            if (variants.contains(name)) {
+                error(std::format("enum '{}' declares variant '{}' more than once", e.name, name));
+                return false;
+            }
             if (value) {
                 next_value = *value;
             }
@@ -6072,6 +6124,9 @@ private:
                     return false;
                 }
                 const auto& info = struct_it->second;
+                if (!check_struct_literal_fields(lit, info)) {
+                    return false;
+                }
                 for (const auto& [field_name, value_expr] : lit.fields) {
                     auto offset_opt = info.get_field_offset(field_name);
                     if (!offset_opt) {
@@ -6953,8 +7008,30 @@ private:
         }
         current_function_return_seen_ = true;
         if (ret.value) {
+            // returning a value from a function that does not return one: the value
+            // is silently discarded and the caller reads garbage. reject it.
+            if (has_current_function_return_type_ && current_function_return_type_.is_void()) {
+                error("returning a value from a function with no return type");
+                return false;
+            }
+            // returning the result of a void call: there is nothing to return.
+            if (auto* call = std::get_if<ast::CallExpr>(&ret.value->kind);
+                call && call->callee && call->callee->is<ast::IdentExpr>()) {
+                auto it = functions_.find(resolve_function_name(call->callee->as<ast::IdentExpr>().name));
+                if (it != functions_.end() && it->second.return_type.is_void()) {
+                    error(std::format("cannot return the result of '{}', which returns void",
+                                      call->callee->as<ast::IdentExpr>().name));
+                    return false;
+                }
+            }
             if (!generate_expr(*ret.value)) return false;
         } else {
+            // `return` with no value in a function that must produce one: the caller
+            // reads RAX uninitialised.
+            if (has_current_function_return_type_ && !current_function_return_type_.is_void()) {
+                error("return with no value from a function that returns a value");
+                return false;
+            }
             emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
         }
         if (has_active_defers_to_function_root()) {
@@ -11875,6 +11952,17 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             [&](const ast::IndexExpr& e)   { return generate_index(e); },
             [&](const ast::FieldExpr& e)   { return generate_field(e); },
             [&](const ast::CastExpr& e)    {
+                // a cast to a name that resolves to no known type silently produced a
+                // zero-payload type and compiled to garbage; reject it.
+                if (auto* named = std::get_if<std::string>(&e.target_type.kind)) {
+                    std::string resolved = resolve_type_name(*named);
+                    bool known = structs_.contains(resolved) || enums_.contains(resolved) ||
+                                 named_type_aliases_.contains(resolved);
+                    if (!known) {
+                        error_unknown_type("cast target type", *named);
+                        return false;
+                    }
+                }
                 if (!generate_expr(*e.expr)) {
                     return false;
                 }
@@ -12068,6 +12156,32 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         return true;
     }
 
+    // a struct literal must name every declared field exactly once. HeapAlloc leaves
+    // omitted fields holding garbage, and a duplicate writes the same slot twice, so
+    // either is a silently wrong value rather than a diagnostic.
+    [[nodiscard]] bool check_struct_literal_fields(const ast::StructExpr& lit,
+                                                   const StructInfo& info) {
+        std::unordered_set<std::string> provided;
+        for (const auto& [field_name, _v] : lit.fields) {
+            if (!info.get_field_offset(field_name)) {
+                error(std::format("struct '{}' has no field '{}'", lit.name, field_name));
+                return false;
+            }
+            if (!provided.insert(field_name).second) {
+                error(std::format("struct literal for '{}' sets field '{}' more than once",
+                                  lit.name, field_name));
+                return false;
+            }
+        }
+        for (const auto& [fname, _t] : info.fields) {
+            if (!provided.contains(fname)) {
+                error(std::format("struct literal for '{}' is missing field '{}'", lit.name, fname));
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] bool generate_struct_literal(const ast::StructExpr& lit) {
         // Look up struct definition
         std::string resolved_name = resolve_type_name(lit.name);
@@ -12078,6 +12192,13 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         }
         
         const StructInfo& info = it->second;
+
+        // every declared field must appear exactly once: HeapAlloc leaves any
+        // omitted field holding garbage, so a partial literal is a silently wrong
+        // value, not a default-initialised one.
+        if (!check_struct_literal_fields(lit, info)) {
+            return false;
+        }
         
         // Allocate memory for struct
         std::size_t size = info.total_size > 0 ? info.total_size : 8;  // min 8 bytes
@@ -12324,6 +12445,21 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
     // returns false (after raising a hard error) when the index is provably out of
     // range, so a guaranteed fault becomes a build failure instead.
     [[nodiscard]] bool check_literal_index_bounds(const ast::IndexExpr& idx, const Type& base_type) {
+        // an index whose type is statically a float or string is never valid: the
+        // element address would be computed from the raw bits.
+        if (idx.index) {
+            auto index_type = infer_expr_type(*idx.index);
+            if (index_type) {
+                auto resolved = canonicalize_type(*index_type);
+                const Type& t = resolved ? *resolved : *index_type;
+                if (t.is_float() || is_str_type(t) || t.is_void()) {
+                    error(std::format("index expression has type '{}'; an integer index is required",
+                                      type_display_name(t)));
+                    return false;
+                }
+            }
+        }
+
         std::int64_t index = 0;
         if (!try_get_i64_immediate(*idx.index, index)) {
             return true;  // not a literal, cannot prove anything
@@ -12394,6 +12530,21 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 elem_type = Type::make_primitive(PrimitiveType::U8);
                 stride = 1;
                 is_typed_raw = true;
+            } else {
+                // indexing a float / void / bool: never a pointer or a handle, so
+                // this can only misbehave. (plain integers are left permissive:
+                // builtins like array_new return a raw i64 handle that IS indexable)
+                if (final_base.is_float() || final_base.is_void() ||
+                    std::holds_alternative<StructType>(final_base.kind)) {
+                    error(std::format("cannot index a value of type '{}'; an array, pointer, or string is required",
+                                      type_display_name(final_base)));
+                    return false;
+                }
+                if (auto* prim = std::get_if<PrimitiveType>(&final_base.kind);
+                    prim && *prim == PrimitiveType::Bool) {
+                    error("cannot index a bool value; an array, pointer, or string is required");
+                    return false;
+                }
             }
         }
 
@@ -12607,6 +12758,30 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 error(bin.op == Op::Div
                           ? "division by zero: the divisor is a literal 0"
                           : "modulo by zero: the divisor is a literal 0");
+                return false;
+            }
+            // integer % is meaningless on a float operand: the remainder is defined
+            // only for integers, and codegen would emit a raw integer op on the bits.
+            if (bin.op == Op::Mod) {
+                auto lhs_t = infer_expr_type(*bin.lhs);
+                if (lhs_t) {
+                    if (auto* prim = std::get_if<PrimitiveType>(&lhs_t->kind);
+                        prim && (*prim == PrimitiveType::F32 || *prim == PrimitiveType::F64)) {
+                        error("modulo '%' requires an integer operand, not a float");
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // shift by a negative literal count is a sign-extension bug: the CPU masks
+        // the count to 6 bits, so `1 << -1` is `1 << 63`, which is never intended.
+        // (a count >= 64 is deliberately left alone: tests/stress_codegen/test03
+        // asserts the masked behaviour is defined and supported)
+        if (bin.op == Op::Shl || bin.op == Op::Shr) {
+            std::int64_t shift_count = 0;
+            if (try_get_i64_immediate(*bin.rhs, shift_count) && shift_count < 0) {
+                error(std::format("shift count {} is negative", shift_count));
                 return false;
             }
         }
@@ -13554,9 +13729,22 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             case Op::BitNot:
                 emit_.not_(x64::Reg::RAX);
                 break;
-            case Op::Deref:
+            case Op::Deref: {
+                // refuse to dereference a value that is statically an integer: this is
+                // always a bug (the integer is treated as an address) and would fault.
+                auto operand_type = infer_expr_type(*un.operand);
+                if (operand_type) {
+                    auto resolved = canonicalize_type(*operand_type);
+                    const Type& t = resolved ? *resolved : *operand_type;
+                    if (t.is_integer() || t.is_float() || t.is_void()) {
+                        error(std::format("cannot dereference a value of type '{}'; a pointer is required",
+                                          type_display_name(t)));
+                        return false;
+                    }
+                }
                 emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, 0);
                 break;
+            }
             case Op::AddrOf:
             case Op::AddrOfMut:
                 // For identifiers, load the address

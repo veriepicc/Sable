@@ -1,0 +1,5 @@
+// dereferencing an integer treats the integer as an address
+function int main() {
+    let x = 5
+    return *x
+}
