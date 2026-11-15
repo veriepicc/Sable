@@ -1928,5 +1928,15 @@
       "bitset: all tests passed\n"
     ],
     "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
+    "Name": "test_strbuf",
+    "File": "tests/test_strbuf.sb",
+    "ExpectedExit": 0,
+    "ExpectedRuntimeOutputContains": [
+      "strbuf: all tests passed\n"
+    ],
+    "RuntimeTimeoutSeconds": 10
   }
 ]

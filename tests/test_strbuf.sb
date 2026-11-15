@@ -1,0 +1,188 @@
+import strbuf
+
+// correctness of stdlib/strbuf.sb: geometric growth, appends, byte-safe content,
+// and round-tripping to a heap string.
+
+function bool str_eq(str a, str b) {
+    return string_equals(a, b) != 0
+}
+
+function int test_basic_append() {
+    let b = strbuf_new()
+    if b == 0 { print("FAIL new\n"); return 1 }
+    if strbuf_len(b) != 0 { print("FAIL fresh len\n"); strbuf_free(b); return 2 }
+    if !strbuf_is_empty(b) { print("FAIL fresh empty\n"); strbuf_free(b); return 3 }
+
+    strbuf_append(b, "hello")
+    if strbuf_len(b) != 5 { print("FAIL len after hello\n"); strbuf_free(b); return 4 }
+    strbuf_append(b, " ")
+    strbuf_append(b, "world")
+    if strbuf_len(b) != 11 { print("FAIL len after world\n"); strbuf_free(b); return 5 }
+
+    let s = strbuf_to_string(b)
+    if !str_eq(s, "hello world") {
+        print("FAIL content: ")
+        println(s)
+        free(s)
+        strbuf_free(b)
+        return 6
+    }
+    free(s)
+    strbuf_free(b)
+    return 0
+}
+
+function int test_growth() {
+    let b = strbuf_new()
+    // append well past the initial capacity in many small pieces
+    var i = 0
+    while i < 500 {
+        strbuf_append(b, "ab")
+        i++
+    }
+    if strbuf_len(b) != 1000 { print("FAIL growth len: "); print_int(strbuf_len(b)); strbuf_free(b); return 1 }
+    if strbuf_capacity(b) < 1000 { print("FAIL growth cap\n"); strbuf_free(b); return 2 }
+
+    let s = strbuf_to_string(b)
+    if string_length(s) != 1000 { print("FAIL growth string len\n"); free(s); strbuf_free(b); return 3 }
+    // spot-check: every byte should be 'a' or 'b'
+    var j = 0
+    while j < 1000 {
+        let c = s[j]
+        if c != 97 && c != 98 { print("FAIL growth byte\n"); free(s); strbuf_free(b); return 4 }
+        j++
+    }
+    free(s)
+    strbuf_free(b)
+    return 0
+}
+
+function int test_int_and_repeat() {
+    let b = strbuf_new()
+    strbuf_append_int(b, 42)
+    strbuf_append(b, ",")
+    strbuf_append_int(b, 0 - 7)
+    let s = strbuf_to_string(b)
+    if !str_eq(s, "42,-7") {
+        print("FAIL int append: ")
+        println(s)
+        free(s)
+        strbuf_free(b)
+        return 1
+    }
+    free(s)
+
+    strbuf_clear(b)
+    strbuf_append_repeat(b, 120, 3)   // 'x' x3
+    let s2 = strbuf_to_string(b)
+    if !str_eq(s2, "xxx") {
+        print("FAIL repeat: ")
+        println(s2)
+        free(s2)
+        strbuf_free(b)
+        return 2
+    }
+    free(s2)
+    strbuf_free(b)
+    return 0
+}
+
+function int test_slice() {
+    let b = strbuf_new()
+    strbuf_append_slice(b, "hello world", 6, 5)
+    let s = strbuf_to_string(b)
+    if !str_eq(s, "world") {
+        print("FAIL slice: ")
+        println(s)
+        free(s)
+        strbuf_free(b)
+        return 1
+    }
+    free(s)
+
+    // out-of-range slice is clamped, never a fault
+    strbuf_clear(b)
+    strbuf_append_slice(b, "abc", 1, 100)
+    let s2 = strbuf_to_string(b)
+    if !str_eq(s2, "bc") { print("FAIL slice clamp\n"); free(s2); strbuf_free(b); return 2 }
+    free(s2)
+
+    strbuf_clear(b)
+    strbuf_append_slice(b, "abc", 10, 5)
+    let s3 = strbuf_to_string(b)
+    if !str_eq(s3, "") { print("FAIL slice past end\n"); free(s3); strbuf_free(b); return 3 }
+    free(s3)
+    strbuf_free(b)
+    return 0
+}
+
+function int test_clear_and_take() {
+    let b = strbuf_new()
+    strbuf_append(b, "abcdef")
+    if strbuf_len(b) != 6 { print("FAIL pre-clear\n"); strbuf_free(b); return 1 }
+    strbuf_clear(b)
+    if strbuf_len(b) != 0 { print("FAIL clear\n"); strbuf_free(b); return 2 }
+
+    strbuf_append(b, "reuse")
+    let taken = strbuf_take_string(b)
+    if !str_eq(taken, "reuse") { print("FAIL take\n"); free(taken); strbuf_free(b); return 3 }
+    if strbuf_len(b) != 0 { print("FAIL take cleared\n"); free(taken); strbuf_free(b); return 4 }
+    free(taken)
+    strbuf_free(b)
+    return 0
+}
+
+function int test_null_safety() {
+    let null_buf: StrBuf = 0 as StrBuf
+    if strbuf_len(null_buf) != 0 { print("FAIL null len\n"); return 1 }
+    if strbuf_capacity(null_buf) != 0 { print("FAIL null cap\n"); return 2 }
+    if !strbuf_is_empty(null_buf) { print("FAIL null empty\n"); return 3 }
+    if strbuf_append(null_buf, "x") { print("FAIL null append\n"); return 4 }
+    if strbuf_push_byte(null_buf, 65) { print("FAIL null push\n"); return 5 }
+    if strbuf_append_int(null_buf, 1) { print("FAIL null int\n"); return 6 }
+    if strbuf_reserve(null_buf, 10) { print("FAIL null reserve\n"); return 7 }
+    strbuf_clear(null_buf)
+    strbuf_free(null_buf)
+    return 0
+}
+
+function int test_many_handles() {
+    // several live builders must not share state
+    let a = strbuf_new()
+    let b = strbuf_new()
+    strbuf_append(a, "aaa")
+    strbuf_append(b, "bbb")
+    strbuf_append(a, "ccc")
+
+    let sa = strbuf_to_string(a)
+    let sb = strbuf_to_string(b)
+    if !str_eq(sa, "aaaccc") { print("FAIL multi a\n"); free(sa); free(sb); strbuf_free(a); strbuf_free(b); return 1 }
+    if !str_eq(sb, "bbb") { print("FAIL multi b\n"); free(sa); free(sb); strbuf_free(a); strbuf_free(b); return 2 }
+    free(sa)
+    free(sb)
+    strbuf_free(a)
+    strbuf_free(b)
+    return 0
+}
+
+function int main() {
+    alloc_console()
+
+    let r1 = test_basic_append()
+    if r1 != 0 { return 10 + r1 }
+    let r2 = test_growth()
+    if r2 != 0 { return 20 + r2 }
+    let r3 = test_int_and_repeat()
+    if r3 != 0 { return 30 + r3 }
+    let r4 = test_slice()
+    if r4 != 0 { return 40 + r4 }
+    let r5 = test_clear_and_take()
+    if r5 != 0 { return 50 + r5 }
+    let r6 = test_null_safety()
+    if r6 != 0 { return 60 + r6 }
+    let r7 = test_many_handles()
+    if r7 != 0 { return 70 + r7 }
+
+    print("strbuf: all tests passed\n")
+    return 0
+}

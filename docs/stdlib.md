@@ -33,6 +33,7 @@ import fmt
 | `cpp_vector` | `view`-backed interop helper for C++-style vector buffers |
 | `hash` | hashing and checksums: FNV-1a, djb2, CRC-32, splitmix64 mix, adler32/sum/xor |
 | `bitset` | growable bitset over heap words: get/set/toggle, popcount, find, set algebra |
+| `strbuf` | growable string builder: `strbuf_append`, `strbuf_append_int`, `strbuf_to_string` |
 | `prelude` | convenience bundle importing core modules |
 
 ## `mem`
@@ -287,6 +288,30 @@ function int main() {
 popcount, `bitset_find_next` iterates set bits, and `bitset_or_into`,
 `bitset_and_count`, `bitset_intersects` do set algebra. Every accessor tolerates
 a null handle (reads yield 0 / false, writes are ignored).
+
+## `strbuf`
+
+Growable string builder. Appending N pieces costs O(total), not the O(N * total)
+of repeated `string_append`. Constructors allocate; release with `strbuf_free`.
+
+```c
+import strbuf
+
+function int main() {
+    let b = strbuf_new()
+    strbuf_append(b, "value=")
+    strbuf_append_int(b, 42)
+    let s = strbuf_to_string(b)      // fresh heap string
+    strbuf_free(b)
+    free(s)
+    return 0
+}
+```
+
+`strbuf_append`, `strbuf_append_int`, `strbuf_append_repeat`,
+`strbuf_push_byte` add content; `strbuf_view` reads the contents mid-build as a
+null-terminated `str` (no allocation); `strbuf_to_string` materializes a heap
+copy; `strbuf_clear` empties it; `strbuf_reserve` grows ahead of a known volume.
 
 ## Notes
 
