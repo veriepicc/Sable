@@ -1958,5 +1958,15 @@
       "math: all tests passed\n"
     ],
     "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
+    "Name": "test_matrix",
+    "File": "tests/test_matrix.sb",
+    "ExpectedExit": 0,
+    "ExpectedRuntimeOutputContains": [
+      "matrix: all tests passed\n"
+    ],
+    "RuntimeTimeoutSeconds": 10
   }
 ]

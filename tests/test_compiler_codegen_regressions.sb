@@ -284,6 +284,77 @@ function int main() {
         return 50 + rg
     }
 
+    // 15: an inlined function's parameter must shadow a caller local of the same
+    // name (the inline alias is the parameter, not the caller's variable).
+    let sg = test_inline_param_shadowing()
+    if sg != 0 {
+        return 60 + sg
+    }
+
+    // 16: an inlined function's null guard must test ITS argument, not a caller
+    // local that shares the parameter's name.
+    let ng2 = test_inline_param_null_guard()
+    if ng2 != 0 {
+        return 70 + ng2
+    }
+
+    return 0
+}
+
+// Regression: when a single-use function is inlined, its parameter names are
+// registered as inline aliases. Several codegen paths looked the caller's own
+// symbol up BEFORE the alias, so a caller local sharing a parameter name captured
+// the inlined body's reads. Below, rd's parameter is named `m` and main also has a
+// local `m`: the old order made rd(m) return m.m instead of t.m.
+view ShadowBox {
+    tag: int @ 0
+    mark: int @ 8
+}
+
+function ShadowBox shadow_make(int tag, int mark) {
+    var h = malloc(16) as ShadowBox
+    if h != 0 {
+        h.tag = tag
+        h.mark = mark
+    }
+    return h
+}
+
+function int shadow_read_tag(ShadowBox m) {
+    if m == 0 {
+        return 0 - 1
+    }
+    return m.tag
+}
+
+function int test_inline_param_shadowing() {
+    let m = shadow_make(7, 8)
+    let t = shadow_make(30, 40)
+    // direct field reads of t are correct
+    if t.tag != 30 { return 1 }
+    // the inlined accessor must see t (its argument), not the caller's m
+    if shadow_read_tag(t) != 30 { return 2 }
+    // and the caller's own m is unaffected
+    if shadow_read_tag(m) != 7 { return 3 }
+    if m.tag != 7 { return 4 }
+    return 0
+}
+
+// the `if p == 0` guard inside an inlined function must test the function's own
+// argument. with a caller local named like the parameter, the old comparison fast
+// path tested the caller's (dangling) handle instead and dereferenced freed memory.
+function int shadow_check_null(ShadowBox m) {
+    if m == 0 {
+        return 0 - 1
+    }
+    return m.mark
+}
+
+function int test_inline_param_null_guard() {
+    let m = shadow_make(1, 2)
+    if shadow_check_null(m) != 2 { return 1 }
+    if shadow_check_null(0 as *ShadowBox) != (0 - 1) { return 2 }
+    if m.mark != 2 { return 3 }
     return 0
 }
 

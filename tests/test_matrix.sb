@@ -1,0 +1,222 @@
+import matrix
+
+// correctness of stdlib/matrix.sb: shape, element access, arithmetic, transpose,
+// multiply, reductions, and comparison. Every expected value is hand-checked.
+
+function int test_shape_and_access() {
+    let m = matrix_new(2, 3)
+    if m == 0 { print("FAIL new\n"); return 1 }
+    if matrix_rows(m) != 2 { print("FAIL rows\n"); matrix_free(m); return 2 }
+    if matrix_cols(m) != 3 { print("FAIL cols\n"); matrix_free(m); return 3 }
+    if matrix_is_empty(m) { print("FAIL not empty\n"); matrix_free(m); return 4 }
+    if matrix_is_square(m) { print("FAIL not square\n"); matrix_free(m); return 5 }
+
+    // freshly zeroed
+    if matrix_get(m, 0, 0) != 0 || matrix_get(m, 1, 2) != 0 { print("FAIL zeros\n"); matrix_free(m); return 6 }
+
+    matrix_set(m, 0, 0, 5)
+    matrix_set(m, 1, 2, 9)
+    if matrix_get(m, 0, 0) != 5 { print("FAIL set/get\n"); matrix_free(m); return 7 }
+    if matrix_get(m, 1, 2) != 9 { print("FAIL set/get 2\n"); matrix_free(m); return 8 }
+    // out of range reads 0, writes ignored
+    if matrix_get(m, 5, 5) != 0 { print("FAIL oob read\n"); matrix_free(m); return 9 }
+    matrix_set(m, 5, 5, 1)
+    if matrix_get(m, 0, 0) != 5 { print("FAIL oob write clobber\n"); matrix_free(m); return 10 }
+    if matrix_get(m, 0 - 1, 0) != 0 { print("FAIL neg read\n"); matrix_free(m); return 11 }
+
+    matrix_free(m)
+
+    // degenerate shapes yield null, not a malformed handle
+    if matrix_new(0, 3) != 0 { print("FAIL zero rows\n"); return 12 }
+    if matrix_new(3, 0) != 0 { print("FAIL zero cols\n"); return 13 }
+    if matrix_new(0 - 2, 3) != 0 { print("FAIL neg rows\n"); return 14 }
+    return 0
+}
+
+function int test_fill_identity_clone() {
+    let m = matrix_new(3, 3)
+    matrix_fill(m, 7)
+    if matrix_get(m, 0, 0) != 7 || matrix_get(m, 2, 2) != 7 { print("FAIL fill\n"); matrix_free(m); return 1 }
+    if matrix_sum(m) != 63 { print("FAIL fill sum\n"); matrix_free(m); return 2 }
+
+    let id = matrix_identity(4)
+    if !matrix_is_square(id) { print("FAIL id square\n"); matrix_free(id); matrix_free(m); return 3 }
+    if matrix_trace(id) != 4 { print("FAIL id trace\n"); matrix_free(id); matrix_free(m); return 4 }
+    if matrix_get(id, 0, 1) != 0 { print("FAIL id offdiag\n"); matrix_free(id); matrix_free(m); return 5 }
+    if matrix_sum(id) != 4 { print("FAIL id sum\n"); matrix_free(id); matrix_free(m); return 6 }
+
+    let c = matrix_clone(m)
+    if !matrix_equals(c, m) { print("FAIL clone eq\n"); matrix_free(c); matrix_free(id); matrix_free(m); return 7 }
+    // mutating the clone must not touch the original
+    matrix_set(c, 0, 0, 99)
+    if matrix_get(m, 0, 0) != 7 { print("FAIL clone independence\n"); matrix_free(c); matrix_free(id); matrix_free(m); return 8 }
+
+    matrix_free(c)
+    matrix_free(id)
+    matrix_free(m)
+    return 0
+}
+
+function int test_transpose() {
+    let m = matrix_new(2, 3)
+    var v = 1
+    var r = 0
+    while r < 2 {
+        var cc = 0
+        while cc < 3 {
+            matrix_set(m, r, cc, v)
+            v++
+            cc++
+        }
+        r++
+    }
+    // m = [1 2 3; 4 5 6]
+    let t = matrix_transpose(m)
+    if matrix_rows(t) != 3 || matrix_cols(t) != 2 { print("FAIL t shape\n"); matrix_free(t); matrix_free(m); return 1 }
+    if matrix_get(t, 0, 0) != 1 || matrix_get(t, 0, 1) != 4 { print("FAIL t cell\n"); matrix_free(t); matrix_free(m); return 2 }
+    if matrix_get(t, 2, 0) != 3 || matrix_get(t, 2, 1) != 6 { print("FAIL t cell 2\n"); matrix_free(t); matrix_free(m); return 3 }
+    // transposing twice returns the original
+    let tt = matrix_transpose(t)
+    if !matrix_equals(tt, m) { print("FAIL t roundtrip\n"); matrix_free(tt); matrix_free(t); matrix_free(m); return 4 }
+
+    matrix_free(tt)
+    matrix_free(t)
+    matrix_free(m)
+    return 0
+}
+
+function int test_add_sub_scale() {
+    let a = matrix_new(2, 2)
+    let b = matrix_new(2, 2)
+    matrix_set(a, 0, 0, 1)
+    matrix_set(a, 0, 1, 2)
+    matrix_set(a, 1, 0, 3)
+    matrix_set(a, 1, 1, 4)
+    matrix_set(b, 0, 0, 10)
+    matrix_set(b, 0, 1, 20)
+    matrix_set(b, 1, 0, 30)
+    matrix_set(b, 1, 1, 40)
+
+    let s = matrix_add(a, b)
+    if matrix_get(s, 0, 0) != 11 || matrix_get(s, 1, 1) != 44 { print("FAIL add\n"); matrix_free(s); matrix_free(b); matrix_free(a); return 1 }
+
+    let d = matrix_sub(b, a)
+    if matrix_get(d, 0, 0) != 9 || matrix_get(d, 1, 1) != 36 { print("FAIL sub\n"); matrix_free(d); matrix_free(s); matrix_free(b); matrix_free(a); return 2 }
+
+    let sc = matrix_scale(a, 3)
+    if matrix_get(sc, 1, 1) != 12 { print("FAIL scale\n"); matrix_free(sc); matrix_free(d); matrix_free(s); matrix_free(b); matrix_free(a); return 3 }
+
+    // shape mismatch yields null
+    let wide = matrix_new(2, 3)
+    if matrix_add(a, wide) != 0 { print("FAIL add mismatch\n"); matrix_free(wide); matrix_free(sc); matrix_free(d); matrix_free(s); matrix_free(b); matrix_free(a); return 4 }
+
+    // add_into mutates in place
+    if !matrix_add_into(a, b) { print("FAIL add_into\n"); matrix_free(wide); matrix_free(sc); matrix_free(d); matrix_free(s); matrix_free(b); matrix_free(a); return 5 }
+    if matrix_get(a, 0, 0) != 11 || matrix_get(a, 1, 1) != 44 { print("FAIL add_into value\n"); matrix_free(wide); matrix_free(sc); matrix_free(d); matrix_free(s); matrix_free(b); matrix_free(a); return 6 }
+
+    matrix_free(wide)
+    matrix_free(sc)
+    matrix_free(d)
+    matrix_free(s)
+    matrix_free(b)
+    matrix_free(a)
+    return 0
+}
+
+function int test_multiply() {
+    // [1 2; 3 4] * [5 6; 7 8] = [19 22; 43 50]
+    let a = matrix_new(2, 2)
+    matrix_set(a, 0, 0, 1) matrix_set(a, 0, 1, 2)
+    matrix_set(a, 1, 0, 3) matrix_set(a, 1, 1, 4)
+    let b = matrix_new(2, 2)
+    matrix_set(b, 0, 0, 5) matrix_set(b, 0, 1, 6)
+    matrix_set(b, 1, 0, 7) matrix_set(b, 1, 1, 8)
+
+    let p = matrix_mul(a, b)
+    if matrix_get(p, 0, 0) != 19 || matrix_get(p, 0, 1) != 22 { print("FAIL mul row0\n"); matrix_free(p); matrix_free(b); matrix_free(a); return 1 }
+    if matrix_get(p, 1, 0) != 43 || matrix_get(p, 1, 1) != 50 { print("FAIL mul row1\n"); matrix_free(p); matrix_free(b); matrix_free(a); return 2 }
+
+    // identity is a left and right unit
+    let id = matrix_identity(2)
+    let ai = matrix_mul(a, id)
+    if !matrix_equals(ai, a) { print("FAIL mul identity\n"); matrix_free(ai); matrix_free(id); matrix_free(p); matrix_free(b); matrix_free(a); return 3 }
+
+    // non-conformable yields null: (2x2) * (3x2)
+    let tall = matrix_new(3, 2)
+    if matrix_mul(a, tall) != 0 { print("FAIL mul mismatch\n"); matrix_free(tall); matrix_free(ai); matrix_free(id); matrix_free(p); matrix_free(b); matrix_free(a); return 4 }
+
+    // 3x2 * 2x4 exercises rectangular multiply
+    let l = matrix_new(3, 2)
+    matrix_fill(l, 2)
+    let r4 = matrix_new(2, 4)
+    matrix_fill(r4, 3)
+    let prod = matrix_mul(l, r4)
+    if matrix_rows(prod) != 3 || matrix_cols(prod) != 4 { print("FAIL rect shape\n"); matrix_free(prod); matrix_free(r4); matrix_free(l); matrix_free(tall); matrix_free(ai); matrix_free(id); matrix_free(p); matrix_free(b); matrix_free(a); return 5 }
+    // each entry is 2*3 + 2*3 = 12
+    if matrix_get(prod, 2, 3) != 12 { print("FAIL rect value\n"); matrix_free(prod); matrix_free(r4); matrix_free(l); matrix_free(tall); matrix_free(ai); matrix_free(id); matrix_free(p); matrix_free(b); matrix_free(a); return 6 }
+
+    matrix_free(prod)
+    matrix_free(r4)
+    matrix_free(l)
+    matrix_free(tall)
+    matrix_free(ai)
+    matrix_free(id)
+    matrix_free(p)
+    matrix_free(b)
+    matrix_free(a)
+    return 0
+}
+
+function int test_reductions_and_compare() {
+    let m = matrix_new(2, 3)
+    matrix_set(m, 0, 0, 4) matrix_set(m, 0, 1, 0 - 2) matrix_set(m, 0, 2, 9)
+    matrix_set(m, 1, 0, 1) matrix_set(m, 1, 1, 7) matrix_set(m, 1, 2, 0 - 5)
+
+    if matrix_sum(m) != 14 { print("FAIL sum\n"); matrix_free(m); return 1 }
+    if matrix_max(m) != 9 { print("FAIL max\n"); matrix_free(m); return 2 }
+    if matrix_min(m) != (0 - 5) { print("FAIL min\n"); matrix_free(m); return 3 }
+
+    let copy = matrix_clone(m)
+    if !matrix_equals(m, copy) { print("FAIL equals\n"); matrix_free(copy); matrix_free(m); return 4 }
+    matrix_set(copy, 0, 0, 100)
+    if matrix_equals(m, copy) { print("FAIL equals diff\n"); matrix_free(copy); matrix_free(m); return 5 }
+
+    // non-square has a trace of 0
+    if matrix_trace(m) != 0 { print("FAIL trace nonsquare\n"); matrix_free(copy); matrix_free(m); return 6 }
+
+    matrix_free(copy)
+    matrix_free(m)
+
+    // null handle tolerates every accessor
+    let none: Matrix = 0 as Matrix
+    if matrix_rows(none) != 0 || matrix_cols(none) != 0 { print("FAIL null dims\n"); return 7 }
+    if !matrix_is_empty(none) { print("FAIL null empty\n"); return 8 }
+    if matrix_is_square(none) { print("FAIL null square\n"); return 9 }
+    if matrix_get(none, 0, 0) != 0 { print("FAIL null get\n"); return 10 }
+    if matrix_sum(none) != 0 { print("FAIL null sum\n"); return 11 }
+    if matrix_trace(none) != 0 { print("FAIL null trace\n"); return 12 }
+    matrix_set(none, 0, 0, 1)
+    matrix_fill(none, 1)
+    matrix_free(none)
+    return 0
+}
+
+function int main() {
+    alloc_console()
+
+    let r1 = test_shape_and_access()
+    if r1 != 0 { return 10 + r1 }
+    let r2 = test_fill_identity_clone()
+    if r2 != 0 { return 20 + r2 }
+    let r3 = test_transpose()
+    if r3 != 0 { return 30 + r3 }
+    let r4 = test_add_sub_scale()
+    if r4 != 0 { return 40 + r4 }
+    let r5 = test_multiply()
+    if r5 != 0 { return 50 + r5 }
+    let r6 = test_reductions_and_compare()
+    if r6 != 0 { return 60 + r6 }
+
+    print("matrix: all tests passed\n")
+    return 0
+}

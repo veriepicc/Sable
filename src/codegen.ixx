@@ -10885,7 +10885,12 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     if (current_scope_ && bin->lhs->is<ast::IdentExpr>() &&
                         rhs_imm >= (std::numeric_limits<std::int32_t>::min)() &&
                         rhs_imm <= (std::numeric_limits<std::int32_t>::max)()) {
-                        if (Symbol* sym = current_scope_->lookup(bin->lhs->as<ast::IdentExpr>().name)) {
+                        // the inline alias wins: inside an inlined body the alias is
+                        // the function's parameter and must shadow a caller local of
+                        // the same name
+                        const ast::Expr* inlined = current_scope_->lookup_inline(bin->lhs->as<ast::IdentExpr>().name);
+                        Symbol* sym = inlined ? nullptr : current_scope_->lookup(bin->lhs->as<ast::IdentExpr>().name);
+                        if (sym) {
                             if (auto bound = lookup_bound_reg(sym)) {
                                 emit_.cmp_smart_imm(*bound, rhs_imm);
                                 jump_patch = emit_.jcc_rel32(*false_cc);
@@ -10933,13 +10938,16 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     while (cur && cur->is<ast::IdentExpr>()) {
                         if (!current_scope_) return std::nullopt;
                         const auto& name = cur->as<ast::IdentExpr>().name;
-                        if (Symbol* sym = current_scope_->lookup(name)) {
-                            if (stack_struct_locals_.contains(sym)) return std::nullopt;
-                            return lookup_bound_reg(sym);
-                        }
+                        // the inline alias wins: inside an inlined body the alias is
+                        // the function's parameter and must shadow a caller local of
+                        // the same name
                         if (const ast::Expr* inlined = current_scope_->lookup_inline(name)) {
                             cur = inlined;
                             continue;
+                        }
+                        if (Symbol* sym = current_scope_->lookup(name)) {
+                            if (stack_struct_locals_.contains(sym)) return std::nullopt;
+                            return lookup_bound_reg(sym);
                         }
                         return std::nullopt;
                     }
@@ -11727,41 +11735,43 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
         if (field.base->is<ast::IdentExpr>()) {
             const auto& ident = field.base->as<ast::IdentExpr>();
-            Symbol* sym = current_scope_->lookup(ident.name);
-            if (sym) {
-                auto sn = get_struct_name(sym->type);
+            // the inline alias wins over a same-named caller local: inside an
+            // inlined body the alias IS the function's parameter
+            const ast::Expr* inline_expr = current_scope_ ? current_scope_->lookup_inline(ident.name) : nullptr;
+            if (inline_expr) {
+                // the alias holds the parameter's value: materialize it into dst and
+                // load the field from there (base_sym stays null, so the tail's
+                // computed-pointer path is used)
+                if (!generate_pure_expr_into(*inline_expr, dst)) {
+                    return false;
+                }
+                auto struct_type = infer_expr_type(*field.base);
+                if (!struct_type) {
+                    return false;
+                }
+                auto sn = get_struct_name(*struct_type);
                 if (!sn) {
-                    error(std::format("variable '{}' is not a struct type", ident.name));
                     return false;
                 }
-                base_sym = sym;
                 struct_name = *sn;
-                if (!generate_bound_ident_into(ident, dst)) {
-                    return false;
-                }
-            } else if (current_scope_) {
-                if (const ast::Expr* inline_expr = current_scope_->lookup_inline(ident.name)) {
-                    auto inline_type = infer_expr_type(*inline_expr);
-                    if (!inline_type) {
-                        error_undefined_name("variable", ident.name, collect_value_name_candidates());
-                        return false;
-                    }
-                    auto sn = get_struct_name(*inline_type);
+                base_sym = nullptr;
+            } else {
+                Symbol* sym = current_scope_->lookup(ident.name);
+                if (sym) {
+                    auto sn = get_struct_name(sym->type);
                     if (!sn) {
                         error(std::format("variable '{}' is not a struct type", ident.name));
                         return false;
                     }
+                    base_sym = sym;
                     struct_name = *sn;
-                    if (!generate_pure_expr_into(*inline_expr, dst)) {
+                    if (!generate_bound_ident_into(ident, dst)) {
                         return false;
                     }
                 } else {
                     error_undefined_name("variable", ident.name, collect_value_name_candidates());
                     return false;
                 }
-            } else {
-                error_undefined_name("variable", ident.name, collect_value_name_candidates());
-                return false;
             }
         } else if (field.base->is<ast::FieldExpr>()) {
             auto base_type = resolve_field_type(field.base->as<ast::FieldExpr>());
@@ -11924,6 +11934,8 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
         if (auto* ident = std::get_if<ast::IdentExpr>(&expr.kind)) {
             if (current_scope_) {
+                // the inline alias wins: an inlined function's parameter names are
+                // registered as aliases and must shadow caller locals of the same name
                 if (const ast::Expr* inline_expr = current_scope_->lookup_inline(ident->name)) {
                     if (generate_pure_expr_into(*inline_expr, dst)) {
                         return true;
@@ -11970,13 +11982,14 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     while (cur && cur->is<ast::IdentExpr>()) {
                         if (!current_scope_) return std::nullopt;
                         const auto& name = cur->as<ast::IdentExpr>().name;
-                        if (Symbol* sym = current_scope_->lookup(name)) {
-                            if (stack_struct_locals_.contains(sym)) return std::nullopt;
-                            return lookup_bound_reg(sym);
-                        }
+                        // the inline alias wins: it is the inlined function's parameter
                         if (const ast::Expr* inlined = current_scope_->lookup_inline(name)) {
                             cur = inlined;
                             continue;
+                        }
+                        if (Symbol* sym = current_scope_->lookup(name)) {
+                            if (stack_struct_locals_.contains(sym)) return std::nullopt;
+                            return lookup_bound_reg(sym);
                         }
                         return std::nullopt;
                     }
@@ -12005,13 +12018,14 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 while (cur && cur->is<ast::IdentExpr>()) {
                     const auto& name = cur->as<ast::IdentExpr>().name;
                     if (!current_scope_) return std::nullopt;
-                    if (Symbol* sym = current_scope_->lookup(name)) {
-                        if (stack_struct_locals_.contains(sym)) return std::nullopt;
-                        return lookup_bound_reg(sym);
-                    }
+                    // the inline alias wins: it is the inlined function's parameter
                     if (const ast::Expr* inlined = current_scope_->lookup_inline(name)) {
                         cur = inlined;
                         continue;
+                    }
+                    if (Symbol* sym = current_scope_->lookup(name)) {
+                        if (stack_struct_locals_.contains(sym)) return std::nullopt;
+                        return lookup_bound_reg(sym);
                     }
                     return std::nullopt;
                 }
@@ -12075,6 +12089,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
     [[nodiscard]] bool generate_ident_into(const ast::IdentExpr& ident, x64::Reg dst) {
         if (current_scope_) {
+            // the inline alias is checked first: when a single-use function is
+            // inlined, its parameter names are registered as aliases, and inside the
+            // inlined body they must shadow any caller local of the same name.
             if (const ast::Expr* inline_expr = current_scope_->lookup_inline(ident.name)) {
                 if (can_generate_pure_expr(*inline_expr) && generate_pure_expr_into(*inline_expr, dst)) {
                     return true;
@@ -12182,9 +12199,11 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
         if (field.base->is<ast::IdentExpr>()) {
             const std::string& var_name = field.base->as<ast::IdentExpr>().name;
-            Symbol* sym = current_scope_->lookup(var_name);
+            // the inline alias wins over a same-named caller local: inside an
+            // inlined body the alias IS the function's parameter
+            const ast::Expr* inlined = current_scope_ ? current_scope_->lookup_inline(var_name) : nullptr;
+            Symbol* sym = inlined ? nullptr : current_scope_->lookup(var_name);
             if (!sym) {
-                const ast::Expr* inlined = current_scope_ ? current_scope_->lookup_inline(var_name) : nullptr;
                 if (!inlined) {
                     error_undefined_name("variable", var_name, collect_value_name_candidates());
                     return false;
@@ -13134,13 +13153,14 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 while (cur && cur->is<ast::IdentExpr>()) {
                     if (!current_scope_) return std::nullopt;
                     const auto& name = cur->as<ast::IdentExpr>().name;
-                    if (Symbol* sym = current_scope_->lookup(name)) {
-                        if (stack_struct_locals_.contains(sym)) return std::nullopt;
-                        return lookup_bound_reg(sym);
-                    }
+                    // the inline alias wins: it is the inlined function's parameter
                     if (const ast::Expr* inlined = current_scope_->lookup_inline(name)) {
                         cur = inlined;
                         continue;
+                    }
+                    if (Symbol* sym = current_scope_->lookup(name)) {
+                        if (stack_struct_locals_.contains(sym)) return std::nullopt;
+                        return lookup_bound_reg(sym);
                     }
                     return std::nullopt;
                 }

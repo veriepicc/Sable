@@ -71,7 +71,7 @@ done
 
 echo
 echo "== stdlib modules (both must compile with zero errors and zero warnings) =="
-for m in hash bitset strbuf codec math; do
+for m in hash bitset strbuf codec math matrix; do
     wine "$SABLE" --fast -Wall -Werror "tests/test_$m.sb" >"$tmp/$m.out" 2>&1
     rc=$?
     n=$({ grep -c "error" "$tmp/$m.out" || true; })
