@@ -307,8 +307,13 @@ private:
     }
 
     void mark_used(const std::string& name) {
-        if (auto it = import_bindings_.find(name); it != import_bindings_.end()) {
-            it->second.used = true;
+        // imports flatten their members into the module namespace, so a reference
+        // to `text_len` must mark `import text` used. match the bound name exactly
+        // (qualified use) or as a `<module>_` prefix (flattened use).
+        for (auto& [bound, b] : import_bindings_) {
+            if (name == bound || name.starts_with(bound + "_")) {
+                b.used = true;
+            }
         }
         if (auto it = declared_names_.find(name); it != declared_names_.end()) {
             if (name != current_decl_name_) {

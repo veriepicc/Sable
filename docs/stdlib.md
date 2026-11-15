@@ -31,6 +31,8 @@ import fmt
 | `result` | `view`-backed result/error wrappers (`ResI64`, `ResStr`, `ResPtr`) |
 | `owner` | manual ownership structs (`OwnedPtr`, `OwnedStr`, `OwnedBlock`) |
 | `cpp_vector` | `view`-backed interop helper for C++-style vector buffers |
+| `hash` | hashing and checksums: FNV-1a, djb2, CRC-32, splitmix64 mix, adler32/sum/xor |
+| `bitset` | growable bitset over heap words: get/set/toggle, popcount, find, set algebra |
 | `prelude` | convenience bundle importing core modules |
 
 ## `mem`
@@ -240,6 +242,51 @@ function int main() {
     return 0
 }
 ```
+
+## `hash`
+
+Hashing and checksums. Every function is pure: nothing allocates or frees.
+
+```c
+import hash
+
+function int main() {
+    let h = hash_fnv1a("hello")        // FNV-1a 64
+    let c = hash_crc32("hello")        // IEEE CRC-32
+    let b = hash_bucket(h, 256)        // 0..255, never negative, never /0
+    let m = hash_mix_i64(0x12345678)   // splitmix64 avalanche
+    return 0
+}
+```
+
+`hash_fnv1a`, `hash_djb2`, `hash_crc32`, `hash_fnv1a_i64` cover strings and
+integers; `hash_fnv1a_bytes`, `hash_crc32_bytes` work on raw buffers with a
+length; `checksum_sum_bytes`, `checksum_xor_bytes`, `checksum_adler32` are the
+cheap integrity checks; `hash_combine` merges two hashes order-sensitively.
+
+## `bitset`
+
+A growable bitset backed by heap 64-bit words. Constructors allocate and the
+caller releases with `bitset_free`; every other call borrows the handle.
+
+```c
+import bitset
+
+function int main() {
+    let s = bitset_new()               // 64 bits
+    bitset_set(s, 5)
+    bitset_set(s, 1000)                // grows automatically
+    if bitset_count(s) != 2 { return 1 }
+    if bitset_find_next(s, 0) != 5 { return 2 }
+    bitset_free(s)
+    return 0
+}
+```
+
+`bitset_get`/`set`/`clear`/`toggle` are bounds-aware, `bitset_count` is a
+popcount, `bitset_find_next` iterates set bits, and `bitset_or_into`,
+`bitset_and_count`, `bitset_intersects` do set algebra. Every accessor tolerates
+a null handle (reads yield 0 / false, writes are ignored).
 
 ## Notes
 
