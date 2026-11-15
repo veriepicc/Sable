@@ -1,0 +1,5 @@
+// a literal index past the end of a string binding must not compile
+function int main() {
+    let s = "hi"
+    return s[1000]
+}

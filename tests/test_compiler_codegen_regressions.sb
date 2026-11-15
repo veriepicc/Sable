@@ -153,6 +153,32 @@ function int test_64bit_imm_operands() {
     return 0
 }
 
+// 10: nested pure subexpressions must not reuse a scratch register that an
+// outer frame still holds live. A non-refcounted scratch set released the
+// register early, so `(A) + (B)` for two nested pure exprs compiled B into
+// the same register that held A.
+function int test_nested_scratch_refcount() {
+    // both sides are two-level pure exprs; both R11 and R10 stay live
+    let a = ((1 | 2) ^ (3 - 4))          // 3 ^ -1 = -4
+    let b = ((5 + 6) - (7 | 8))          // 11 - 15 = -4
+    if a != -4 { return -1 }
+    if b != -4 { return -2 }
+    if (a + b) != -8 { return -3 }
+    if (a ^ b) != 0 { return -4 }
+
+    // longer chains force deeper scratch nesting
+    let c = ((1 + 2) + (3 - 4)) + ((5 * 6) - (7 ^ 8))   // 2 + 15 = 17
+    if c != 17 { return -5 }
+
+    let d = (((10 - 1) | 2) ^ (3 + 4)) + (((20 / 2) - 1) & 7)  // (11 ^ 7) + 1 = 12 + 1 = 13
+    if d != 13 { return -6 }
+
+    // the original fuzz find: a four-operand mix of nested pure exprs
+    let e = (((754 - 515) ^ (713 + 317)) - ((196 | -453) ^ (291 - 364)))  // 1257 - 328 = 929
+    if e != 929 { return -7 }
+    return 0
+}
+
 function int main() {
     // 1 & 2: view RCX preservation + pure cmp rhs
     let raw = malloc(24)
@@ -227,5 +253,224 @@ function int main() {
         return 11
     }
 
+    // 10: nested pure exprs must not reuse an outer frame's live scratch reg
+    let nested = test_nested_scratch_refcount()
+    if nested != 0 {
+        return 12 + (-nested)
+    }
+
+    // 11: runtime division guards (no #DE fault on zero divisor or MIN/-1)
+    let dg = test_runtime_div_guards()
+    if dg != 0 {
+        return 20 + dg
+    }
+
+    // 12: null pointer indexing must not fault (reads yield 0, stores ignored)
+    let ng = test_null_index_guards()
+    if ng != 0 {
+        return 30 + ng
+    }
+
+    // 13: null struct pointers and computed out-of-range indices must not fault
+    let fg = test_null_field_and_oob_guards()
+    if fg != 0 {
+        return 40 + fg
+    }
+
+    // 14: an idiv (from %) must not leave a stale value registered in RDX, and the
+    // peephole must not delete a move that a branch jumps directly onto.
+    let rg = test_divmod_rdx_and_jump_target_guards()
+    if rg != 0 {
+        return 50 + rg
+    }
+
+    // 15: an inlined function's parameter must shadow a caller local of the same
+    // name (the inline alias is the parameter, not the caller's variable).
+    let sg = test_inline_param_shadowing()
+    if sg != 0 {
+        return 60 + sg
+    }
+
+    // 16: an inlined function's null guard must test ITS argument, not a caller
+    // local that shares the parameter's name.
+    let ng2 = test_inline_param_null_guard()
+    if ng2 != 0 {
+        return 70 + ng2
+    }
+
+    return 0
+}
+
+// Regression: when a single-use function is inlined, its parameter names are
+// registered as inline aliases. Several codegen paths looked the caller's own
+// symbol up BEFORE the alias, so a caller local sharing a parameter name captured
+// the inlined body's reads. Below, rd's parameter is named `m` and main also has a
+// local `m`: the old order made rd(m) return m.m instead of t.m.
+view ShadowBox {
+    tag: int @ 0
+    mark: int @ 8
+}
+
+function ShadowBox shadow_make(int tag, int mark) {
+    var h = malloc(16) as ShadowBox
+    if h != 0 {
+        h.tag = tag
+        h.mark = mark
+    }
+    return h
+}
+
+function int shadow_read_tag(ShadowBox m) {
+    if m == 0 {
+        return 0 - 1
+    }
+    return m.tag
+}
+
+function int test_inline_param_shadowing() {
+    let m = shadow_make(7, 8)
+    let t = shadow_make(30, 40)
+    // direct field reads of t are correct
+    if t.tag != 30 { return 1 }
+    // the inlined accessor must see t (its argument), not the caller's m
+    if shadow_read_tag(t) != 30 { return 2 }
+    // and the caller's own m is unaffected
+    if shadow_read_tag(m) != 7 { return 3 }
+    if m.tag != 7 { return 4 }
+    return 0
+}
+
+// the `if p == 0` guard inside an inlined function must test the function's own
+// argument. with a caller local named like the parameter, the old comparison fast
+// path tested the caller's (dangling) handle instead and dereferenced freed memory.
+function int shadow_check_null(ShadowBox m) {
+    if m == 0 {
+        return 0 - 1
+    }
+    return m.mark
+}
+
+function int test_inline_param_null_guard() {
+    let m = shadow_make(1, 2)
+    if shadow_check_null(m) != 2 { return 1 }
+    if shadow_check_null(0 as *ShadowBox) != (0 - 1) { return 2 }
+    if m.mark != 2 { return 3 }
+    return 0
+}
+
+// Regression: `%` uses RDX as the idiv remainder register. A parameter that lands
+// in RDX (the 2nd argument) used to be destroyed by the divide and read back
+// clobbered. Also covers the peephole copy-back rule deleting `mov r8, rax` when a
+// conditional branch jumps straight onto it.
+function i64 divmod_param_in_rdx(i64 v, i64 m) {
+    var r = v % m
+    var pad1 = 0
+    var pad2 = 0
+    if r < 0 { r = r + m }
+    if r < 0 { r = 99 }
+    if pad1 > 0 { pad2 = 1 }
+    if pad2 > 0 { pad1 = 2 }
+    if pad1 > 1 { pad2 = 3 }
+    return r
+}
+
+function int test_divmod_rdx_and_jump_target_guards() {
+    // m is the 2nd parameter => bound to RDX by the leaf register plan. after the
+    // `%`, m must still be 3, so the correction gives -1 + 3 == 2.
+    if divmod_param_in_rdx(0 - 1, 3) != 2 { return 1 }
+    if divmod_param_in_rdx(0 - 7, 5) != 3 { return 2 }
+    if divmod_param_in_rdx(10, 3) != 1 { return 3 }
+
+    // the same modulo through a parameter that lands in RCX must also hold
+    if divmod_param_in_rcx(3, 0 - 1) != 2 { return 4 }
+
+    // a plain modulo used twice still yields the truncated remainders (-8 % 3 == -2,
+    // so a + b == -4)
+    if divmod_twice(0 - 8, 3) != (0 - 4) { return 5 }
+    return 0
+}
+
+function i64 divmod_param_in_rcx(i64 m, i64 v) {
+    var r = v % m
+    var pad1 = 0
+    var pad2 = 0
+    if r < 0 { r = r + m }
+    if r < 0 { r = 99 }
+    if pad1 > 0 { pad2 = 1 }
+    if pad2 > 0 { pad1 = 2 }
+    if pad1 > 1 { pad2 = 3 }
+    return r
+}
+
+function i64 divmod_twice(i64 v, i64 m) {
+    var a = v % m
+    var b = v % m
+    return a + b
+}
+
+struct NullGuardPoint {
+    x: int
+    y: int
+}
+
+function int test_null_field_and_oob_guards() {
+    // a null struct pointer: reads yield 0 instead of faulting
+    let p: *NullGuardPoint = 0 as *NullGuardPoint
+    if p.x != 0 { return 1 }
+    if p.y != 0 { return 2 }
+
+    // a computed index that runs off the end of a heap array must read 0
+    let arr = [10, 20, 30]
+    let big = 5000000
+    if arr[big] != 0 { return 3 }
+    let neg = 0 - 4
+    if arr[neg] != 0 { return 4 }
+
+    // in-range computed index still returns the real element
+    let i = 1
+    if arr[i] != 20 { return 5 }
+
+    return 0
+}
+
+function int test_null_index_guards() {
+    let p: *int = 0 as *int
+    if p[3] != 0 { return 1 }
+    p[3] = 99              // must be ignored
+    if p[3] != 0 { return 2 }
+
+    let s: str = 0 as str
+    if s[0] != 0 { return 3 }
+
+    let b: *byte = 0 as *byte
+    if b[7] != 0 { return 4 }
+    b[7] = 5               // must be ignored
+
+    // real pointers keep working
+    let q = malloc(16) as *int
+    q[2] = 42
+    if q[2] != 42 { free(q); return 5 }
+    free(q)
+    return 0
+}
+
+// runtime div/mod must never fault: /0 and %0 yield 0, INT64_MIN/-1 wraps.
+function int test_runtime_div_guards() {
+    let zero = 0
+    let one = 1
+    let minus_one = 0 - 1
+    let min_int = 0 - 9223372036854775807 - 1
+
+    if min_int / minus_one != min_int { return 1 }
+    if min_int % minus_one != 0 { return 2 }
+    if 20 / minus_one != -20 { return 3 }
+    if 0 - 20 != 0 && (0 - 20) / minus_one != 20 { return 4 }
+    if 20 % minus_one != 0 { return 5 }
+    let q = 100 / zero
+    if q != 0 { return 6 }
+    let r = 100 % zero
+    if r != 0 { return 7 }
+    if 7 / one != 7 or 7 % one != 0 { return 8 }
+    if 0 / 500 != 0 { return 9 }
     return 0
 }

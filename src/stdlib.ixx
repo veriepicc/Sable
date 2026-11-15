@@ -382,6 +382,758 @@ function str ascii_hex_byte(int byte_value) {
     return out
 }
 )SBASCII"},
+        {"bitset", R"SBBITSET(import mem
+
+// Dynamic bitset: a growable array of bits backed by a heap block of 64-bit
+// words.
+//
+// Ownership:
+// - bitset_new / bitset_with_capacity / bitset_clone allocate; the caller owns
+//   the returned handle and must release it with bitset_free.
+// - every other function borrows the handle and allocates nothing.
+//
+// Layout: the handle is a view over a 24-byte header.
+//   [0]  words   : ptr  -> heap block of 8-byte words, words[0] is bit 0..63
+//   [8]  word_count : int  -> number of allocated words
+//   [16] bit_count  : int  -> number of valid bits (<= word_count*64)
+//
+// All bits above bit_count read as 0 and are cleared on resize, so a bits bit is
+// always a valid bit.
+
+view BitSet {
+    words: ptr @ 0
+    word_count: int @ 8
+    bit_count: int @ 16
+}
+
+// one word is 64 bits
+let BITSET_WORD_BITS: int = 64
+
+function int bitset_words_for(int bit_count) {
+    if bit_count <= 0 {
+        return 0
+    }
+    return (bit_count + BITSET_WORD_BITS - 1) / BITSET_WORD_BITS
+}
+
+function BitSet bitset_alloc_handle() {
+    var handle = malloc(24) as BitSet
+    if handle != 0 {
+        handle.words = 0
+        handle.word_count = 0
+        handle.bit_count = 0
+    }
+    return handle
+}
+
+function BitSet bitset_new() {
+    return bitset_with_capacity(64)
+}
+
+function BitSet bitset_with_capacity(int bit_count) {
+    if bit_count <= 0 {
+        return bitset_alloc_handle()
+    }
+    let needed = bitset_words_for(bit_count)
+    var block = mem.make_zero(needed * 8)
+    if block == 0 {
+        return 0 as BitSet
+    }
+    let handle = bitset_alloc_handle()
+    if handle == 0 {
+        free(block)
+        return 0 as BitSet
+    }
+    handle.words = block
+    handle.word_count = needed
+    // logical size is the requested count; the allocated words round up, but the
+    // tail bits are already zero so they read false
+    handle.bit_count = bit_count
+    return handle
+}
+
+function BitSet bitset_clone(BitSet source) {
+    if source == 0 {
+        return 0 as BitSet
+    }
+    let words = source.word_count
+    var block = 0 as ptr
+    if words > 0 {
+        block = mem.make_copy(source.words, words * 8)
+        if block == 0 {
+            return 0 as BitSet
+        }
+    }
+    let handle = bitset_alloc_handle()
+    if handle == 0 {
+        free(block)
+        return 0 as BitSet
+    }
+    handle.words = block
+    handle.word_count = words
+    handle.bit_count = source.bit_count
+    return handle
+}
+
+function void bitset_free(BitSet bits) {
+    if bits == 0 {
+        return
+    }
+    if bits.words != 0 {
+        free(bits.words)
+        bits.words = 0
+    }
+    free(bits)
+}
+
+function int bitset_len(BitSet bits) {
+    if bits == 0 {
+        return 0
+    }
+    return bits.bit_count
+}
+
+function bool bitset_is_empty(BitSet bits) {
+    if bits == 0 || bits.bit_count <= 0 {
+        return true
+    }
+    let words = bits.words as *i64
+    var i = 0
+    while i < bits.word_count {
+        if words[i] != 0 {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+// grow so that `bit_count` bits are representable. existing bits are preserved;
+// new bits are zero. returns false on allocation failure (the bits is untouched).
+function bool bitset_reserve(BitSet bits, int bit_count) {
+    if bits == 0 {
+        return false
+    }
+    if bit_count <= bits.bit_count {
+        return true
+    }
+    let old_words = bits.word_count
+    let new_words = bitset_words_for(bit_count)
+    if new_words <= old_words {
+        bits.bit_count = bit_count
+        return true
+    }
+    let block = mem.make_zero(new_words * 8)
+    if block == 0 {
+        return false
+    }
+    if old_words > 0 && bits.words != 0 {
+        mem.copy_cells(block, bits.words, old_words)
+        free(bits.words)
+    }
+    bits.words = block
+    bits.word_count = new_words
+    bits.bit_count = bit_count
+    return true
+}
+
+// read a bit. any index outside [0, bit_count) reads false.
+function bool bitset_get(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return false
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    let word = words[word_index]
+    return ((word >> bit_index) & 1) != 0
+}
+
+function i64 bitset_word_mask(int bit_index) {
+    return 1 << bit_index
+}
+
+// bits a bit to 1, growing if needed. returns false on allocation failure.
+function bool bitset_set(BitSet bits, int index) {
+    if bits == 0 || index < 0 {
+        return false
+    }
+    if index >= bits.bit_count {
+        if !bitset_reserve(bits, index + 1) {
+            return false
+        }
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] | bitset_word_mask(bit_index)
+    return true
+}
+
+// bits a bit to 0. does not grow; a bit outside the range is already 0.
+function void bitset_clear(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] & (bitset_word_mask(bit_index) ^ (0 - 1))
+}
+
+function void bitset_toggle(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] ^ bitset_word_mask(bit_index)
+}
+
+function void bitset_set_all(BitSet bits) {
+    if bits == 0 || bits.word_count <= 0 {
+        return
+    }
+    let words = bits.words as *i64
+    var i = 0
+    while i < bits.word_count {
+        words[i] = 0 - 1
+        i++
+    }
+    bitset_trim_tail(bits)
+}
+
+function void bitset_clear_all(BitSet bits) {
+    if bits == 0 || bits.words == 0 {
+        return
+    }
+    memset(bits.words, 0, bits.word_count * 8)
+}
+
+// the top word can hold bits beyond bit_count; mask them off after set_all.
+function void bitset_trim_tail(BitSet bits) {
+    if bits == 0 || bits.word_count <= 0 || bits.bit_count <= 0 {
+        return
+    }
+    let used_in_last = bits.bit_count % BITSET_WORD_BITS
+    if used_in_last == 0 {
+        return
+    }
+    let words = bits.words as *i64
+    let last = bits.word_count - 1
+    let keep = (1 << used_in_last) - 1
+    words[last] = words[last] & keep
+}
+
+// number of bits bits. cheap to compute, this is a straightforward popcount.
+function int bitset_count(BitSet bits) {
+    if bits == 0 || bits.words == 0 {
+        return 0
+    }
+    let words = bits.words as *i64
+    var total = 0
+    var i = 0
+    while i < bits.word_count {
+        var word = words[i]
+        while word != 0 {
+            word = word & (word - 1)
+            total++
+        }
+        i++
+    }
+    return total
+}
+
+// index of the first bits bit at or after `start`, or -1 if none.
+function int bitset_find_next(BitSet bits, int start) {
+    if bits == 0 || bits.bit_count <= 0 {
+        return -1
+    }
+    var index = start
+    if index < 0 {
+        index = 0
+    }
+    while index < bits.bit_count {
+        if bitset_get(bits, index) {
+            return index
+        }
+        index++
+    }
+    return -1
+}
+
+// bitset_set(a, index) for every bits bit in b. grows a as needed.
+function void bitset_or_into(BitSet target, BitSet source) {
+    if target == 0 || source == 0 {
+        return
+    }
+    var index = bitset_find_next(source, 0)
+    while index >= 0 {
+        bitset_set(target, index)
+        index = bitset_find_next(source, index + 1)
+    }
+}
+
+function int bitset_and_count(BitSet a, BitSet b) {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    let words_a = a.words as *i64
+    let words_b = b.words as *i64
+    var shared = a.word_count
+    if b.word_count < shared {
+        shared = b.word_count
+    }
+    var total = 0
+    var i = 0
+    while i < shared {
+        var word = words_a[i] & words_b[i]
+        while word != 0 {
+            word = word & (word - 1)
+            total++
+        }
+        i++
+    }
+    return total
+}
+
+// true when a and b share at)SBBITSET"
+            R"SBBITSET( least one bits bit.
+function bool bitset_intersects(BitSet a, BitSet b) {
+    if a == 0 || b == 0 {
+        return false
+    }
+    let words_a = a.words as *i64
+    let words_b = b.words as *i64
+    var shared = a.word_count
+    if b.word_count < shared {
+        shared = b.word_count
+    }
+    var i = 0
+    while i < shared {
+        if (words_a[i] & words_b[i]) != 0 {
+            return true
+        }
+        i++
+    }
+    return false
+}
+)SBBITSET"},
+        {"codec", R"SBCODEC(import mem
+
+// Hex and Base64 codecs over raw bytes and strings.
+//
+// Everything here round-trips: decode(encode(x)) == x for the byte ranges these
+// functions accept. Byte-oriented entry points take (ptr, len); the string
+// convenience wrappers operate on the string's raw bytes, so a string containing
+// a NUL byte still encodes fully (length comes from string_length, not strlen).
+//
+// Ownership: every function that returns `str` returns a fresh heap string; the
+// caller must free it. `*_into` variants write into a caller-supplied buffer and
+// allocate nothing.
+
+// ---- hex -------------------------------------------------------------------
+
+let CODEC_HEX_LOWER: str = "0123456789abcdef"
+let CODEC_HEX_UPPER: str = "0123456789ABCDEF"
+
+function int codec_hex_char_value(int ch) {
+    if ch >= 48 && ch <= 57 {
+        return ch - 48
+    }
+    if ch >= 97 && ch <= 102 {
+        return 10 + (ch - 97)
+    }
+    if ch >= 65 && ch <= 70 {
+        return 10 + (ch - 65)
+    }
+    return 0 - 1
+}
+
+// number of characters hex_encode_bytes will produce
+function int codec_hex_encoded_len(int len) {
+    if len <= 0 {
+        return 0
+    }
+    return len * 2
+}
+
+// number of bytes hex_decode_to_bytes will produce for `len` input chars
+function int codec_hex_decoded_len(int len) {
+    if len <= 0 {
+        return 0
+    }
+    return (len + 1) / 2
+}
+
+// encode bytes as lowercase hex into a caller buffer. returns chars written.
+function int codec_hex_encode_into(ptr dst, ptr src, int len) {
+    if dst == 0 || src == 0 || len <= 0 {
+        return 0
+    }
+    let digits = CODEC_HEX_LOWER
+    var w = 0
+    var i = 0
+    while i < len {
+        let byte_value = mem.read8(src + i) & 0xFF
+        mem.write8(dst + w, mem.read8((digits as ptr) + (byte_value >> 4)))
+        mem.write8(dst + w + 1, mem.read8((digits as ptr) + (byte_value & 15)))
+        w = w + 2
+        i++
+    }
+    return w
+}
+
+function int codec_hex_encode_upper_into(ptr dst, ptr src, int len) {
+    if dst == 0 || src == 0 || len <= 0 {
+        return 0
+    }
+    let digits = CODEC_HEX_UPPER
+    var w = 0
+    var i = 0
+    while i < len {
+        let byte_value = mem.read8(src + i) & 0xFF
+        mem.write8(dst + w, mem.read8((digits as ptr) + (byte_value >> 4)))
+        mem.write8(dst + w + 1, mem.read8((digits as ptr) + (byte_value & 15)))
+        w = w + 2
+        i++
+    }
+    return w
+}
+
+// encode bytes as lowercase hex; returns a fresh heap string
+function str codec_hex_encode(ptr src, int len) {
+    var result = 0 as ptr
+    if src != 0 && len > 0 {
+        let block = malloc(codec_hex_encoded_len(len) + 1)
+        if block != 0 {
+            let written = codec_hex_encode_into(block, src, len)
+            mem.write8(block + written, 0)
+            result = block
+        }
+    }
+    return codec_result_string(result)
+}
+
+function str codec_hex_encode_upper(ptr src, int len) {
+    var result = 0 as ptr
+    if src != 0 && len > 0 {
+        let block = malloc(codec_hex_encoded_len(len) + 1)
+        if block != 0 {
+            let written = codec_hex_encode_upper_into(block, src, len)
+            mem.write8(block + written, 0)
+            result = block
+        }
+    }
+    return codec_result_string(result)
+}
+
+// turn a freshly-allocated buffer (or a null on failure) into a str, producing an
+// owned empty string when the allocation did not happen
+function str codec_result_string(ptr block) {
+    if block == 0 {
+        return make_string("")
+    }
+    return block as str
+}
+
+// decode hex characters into a caller buffer. non-hex characters are skipped so
+// "0x-1a" still decodes; an odd trailing nibble is treated as the high nibble.
+// returns bytes written.
+function int codec_hex_decode_to_bytes(ptr dst, str hex_text) {
+    if dst == 0 || hex_text == 0 {
+        return 0
+    }
+    let len = string_length(hex_text)
+    var src = hex_text as ptr
+    var high = 0 - 1
+    var w = 0
+    var i = 0
+    while i < len {
+        let nibble = codec_hex_char_value(mem.read8(src + i) & 0xFF)
+        if nibble >= 0 {
+            if high < 0 {
+                high = nibble
+            } else {
+                mem.write8(dst + w, (high << 4) | nibble)
+                w = w + 1
+                high = 0 - 1
+            }
+        }
+        i++
+    }
+    if high >= 0 {
+        // an odd number of nibbles: the last one is the high nibble of a byte
+        mem.write8(dst + w, high << 4)
+        w = w + 1
+    }
+    return w
+}
+
+// decode hex into a fresh heap block of raw bytes. Because a native-image `str`
+// is NUL-terminated, the byte count cannot be recovered from the string once a
+// 0x00 byte appears: for binary data use codec_hex_decode_to_bytes into a buffer
+// you size with codec_hex_decoded_len, which returns the true byte count.
+function str codec_hex_decode(str hex_text) {
+    var result = 0 as ptr
+    if hex_text != 0 {
+        let chars = string_length(hex_text)
+        if chars > 0 {
+            let block = malloc(codec_hex_decoded_len(chars) + 1)
+            if block != 0 {
+                let written = codec_hex_decode_to_bytes(block, hex_text)
+                mem.write8(block + written, 0)
+                result = block
+            }
+        }
+    }
+    return codec_result_string(result)
+}
+
+// length in bytes that codec_hex_decode produced (hex chars / 2, rounded up)
+function int codec_hex_decoded_length_of(str hex_text) {
+    if hex_text == 0 {
+        return 0
+    }
+    var count = 0
+    let len = string_length(hex_text)
+    var i = 0
+    while i < len {
+        if codec_hex_char_value(mem.read8((hex_text as ptr) + i) & 0xFF) >= 0 {
+            count = count + 1
+        }
+        i++
+    }
+    return (count + 1) / 2
+}
+
+// ---- base64 ----------------------------------------------------------------
+
+let CODEC_B64_PAD: int = 61   // '='
+
+function int codec_b64_char(int index) {
+    if index < 26 {
+        return 65 + index
+    }
+    if index < 52 {
+        return 97 + (index - 26)
+    }
+    if index < 62 {
+        return 48 + (index - 52)
+    }
+    if index == 62 {
+        return 43   // '+'
+    }
+    return 47       // '/'
+}
+
+function int codec_b64_value(int ch) {
+    if ch >= 65 && ch <= 90 {
+        return ch - 65
+    }
+    if ch >= 97 && ch <= 122 {
+        return 26 + (ch - 97)
+    }
+    if ch >= 48 && ch <= 57 {
+        return 52 + (ch - 48)
+    }
+    if ch == 43 {
+        return 62
+    }
+    if ch == 47 {
+        return 63
+    }
+    return 0 - 1
+}
+
+// characters base64_encode_bytes produces (including '=' padding)
+function int codec_b64_encoded_len(int len) {
+    if len <= 0 {
+        return 0
+    }
+    return ((len + 2) / 3) * 4
+}
+
+// upper bound on bytes a base64 string of `chars` characters can decode to
+function int codec_b64_decoded_len(int chars) {
+    if chars <= 0 {
+        return 0
+    }
+    return ((chars + 3) / 4) * 3
+}
+
+// encode bytes as standard base64 with '=' padding. returns chars written.
+function int codec_b64_encode_into(ptr dst, ptr src, int len) {
+    if dst == 0 || src == 0 || len <= 0 {
+        return 0
+    }
+    var w = 0
+    var i = 0
+    while i < len {
+        let b0 = mem.read8(src + i) & 0xFF
+        var b1 = 0
+        var b2 = 0
+        let have1 = i + 1 < len
+        let have2 = i + 2 < len
+        if have1 {
+            b1 = mem.read8(src + i + 1) & 0xFF
+        }
+        if have2 {
+            b2 = mem.read8(src + i + 2) & 0xFF
+        }
+        mem.write8(dst + w, codec_b64_char((b0 >> 2) & 63))
+        mem.write8(dst + w + 1, codec_b64_char(((b0 & 3) << 4) | ((b1 >> 4) & 15)))
+        if have1 {
+            mem.write8(dst + w + 2, codec_b64_char(((b1 & 15) << 2) | ((b2 >> 6) & 3)))
+        } else {
+            mem.write8(dst + w + 2, CODEC_B64_PAD)
+        }
+        if have2 {
+            mem.write8(dst + w + 3, codec_b64_char(b2 & 63))
+        } else {
+            mem.write8(dst + w + 3, CODEC_B64_PAD)
+        }
+        w = w + 4
+        i = i + 3
+    }
+    return w
+}
+
+function str codec_b64_encode(ptr src, int len) {
+    var result = 0 as ptr
+    if src != 0 && len > 0 {
+        let block = malloc(codec_b64_encoded_len(len) + 1)
+        if block != 0 {
+            let written = codec_b64_encode_into(block, src, len)
+            mem.write8(block + wri)SBCODEC"
+            R"SBCODEC(tten, 0)
+            result = block
+        }
+    }
+    return codec_result_string(result)
+}
+
+// encode a string's raw bytes as base64
+function str codec_b64_encode_str(str text_value) {
+    if text_value == 0 {
+        return make_string("")
+    }
+    return codec_b64_encode(text_value as ptr, string_length(text_value))
+}
+
+// decode base64 into a caller buffer. '=' padding and any non-alphabet character
+// are ignored, so a wrapped/multi-line blob still decodes. returns bytes written.
+function int codec_b64_decode_to_bytes(ptr dst, str b64_text) {
+    if dst == 0 || b64_text == 0 {
+        return 0
+    }
+    let len = string_length(b64_text)
+    var src = b64_text as ptr
+    var accumulator = 0
+    var bits = 0
+    var w = 0
+    var i = 0
+    while i < len {
+        let value_of = codec_b64_value(mem.read8(src + i) & 0xFF)
+        if value_of >= 0 {
+            accumulator = (accumulator << 6) | value_of
+            bits = bits + 6
+            if bits >= 8 {
+                bits = bits - 8
+                mem.write8(dst + w, (accumulator >> bits) & 0xFF)
+                w = w + 1
+            }
+        }
+        i++
+    }
+    return w
+}
+
+// decode base64 into a fresh heap block of raw bytes. As with hex, the byte count
+// is not recoverable from a NUL-terminated str once a 0x00 byte appears, so for
+// binary data decode with codec_b64_decode_to_bytes into a buffer sized with
+// codec_b64_decoded_len; that variant returns the true byte count.
+function str codec_b64_decode(str b64_text) {
+    var result = 0 as ptr
+    if b64_text != 0 {
+        let chars = string_length(b64_text)
+        if chars > 0 {
+            let block = malloc(codec_b64_decoded_len(chars) + 1)
+            if block != 0 {
+                let written = codec_b64_decode_to_bytes(block, b64_text)
+                mem.write8(block + written, 0)
+                result = block
+            }
+        }
+    }
+    return codec_result_string(result)
+}
+
+// number of bytes a base64 string decodes to, ignoring padding and non-alphabet
+function int codec_b64_decoded_length_of(str b64_text) {
+    if b64_text == 0 {
+        return 0
+    }
+    var symbols = 0
+    let len = string_length(b64_text)
+    var i = 0
+    while i < len {
+        if codec_b64_value(mem.read8((b64_text as ptr) + i) & 0xFF) >= 0 {
+            symbols = symbols + 1
+        }
+        i++
+    }
+    return (symbols * 6) / 8
+}
+
+// ---- round-trip helpers ----------------------------------------------------
+
+// true when two raw byte ranges are equal in length and content
+function bool codec_bytes_equal(ptr a, int len_a, ptr b, int len_b) {
+    if len_a != len_b {
+        return false
+    }
+    if len_a <= 0 {
+        return true
+    }
+    if a == 0 || b == 0 {
+        return false
+    }
+    return memcmp(a, b, len_a) == 0
+}
+
+// true when `bytes` (length `len`) survives a hex encode/decode round trip
+function bool codec_hex_roundtrip(ptr bytes, int len) {
+    var outcome = false
+    if bytes != 0 && len > 0 {
+        let encoded = codec_hex_encode(bytes, len)
+        let dst = malloc(codec_hex_decoded_len(string_length(encoded)) + 1)
+        if dst != 0 {
+            let written = codec_hex_decode_to_bytes(dst, encoded)
+            outcome = codec_bytes_equal(dst, written, bytes, len)
+            free(dst)
+        }
+        free(encoded)
+    }
+    return outcome
+}
+
+function bool codec_b64_roundtrip(ptr bytes, int len) {
+    var outcome = false
+    if bytes != 0 && len > 0 {
+        let encoded = codec_b64_encode(bytes, len)
+        let dst = malloc(codec_b64_decoded_len(string_length(encoded)) + 1)
+        if dst != 0 {
+            let written = codec_b64_decode_to_bytes(dst, encoded)
+            outcome = codec_bytes_equal(dst, written, bytes, len)
+            free(dst)
+        }
+        free(encoded)
+    }
+    return outcome
+}
+)SBCODEC"},
         {"cpp_vector", R"SBCPPVECTO(import mem
 import vec
 
@@ -814,6 +1566,198 @@ function bool fs_contains(str file_path, str needle) {
     return ok
 }
 )SBFS"},
+        {"hash", R"SBHASH(import mem
+
+// Hashing and checksums.
+//
+// Every function here is pure over its inputs: nothing allocates, nothing frees,
+// nothing mutates the caller's memory. A hash is just an i64; run it through
+// hash_mix_i64 and hash_bucket before using it as an index, because the raw
+// hashes of short inputs are correlated in their low bits.
+//
+// Ownership: none of these functions return heap memory.
+
+// FNV-1a 64-bit constants.
+let HASH_FNV_OFFSET: i64 = 0xCBF29CE484222325
+let HASH_FNV_PRIME: i64 = 0x100000001B3
+
+// mask for the low 32 bits, used by the 32-bit CRC and the u32 wrapper.
+let HASH_MASK32: i64 = 0xFFFFFFFF
+
+// splitmix64 finalizer constants.
+let HASH_MIX_MUL1: i64 = 0xBF58476D1CE4E5B9
+let HASH_MIX_MUL2: i64 = 0x94D049BB133111EB
+
+// FNV-1a over a raw buffer. Empty input yields the offset basis, which is a
+// defined non-zero value, not an error.
+function i64 hash_fnv1a_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return HASH_FNV_OFFSET
+    }
+    let bytes = data as *u8
+    var h = HASH_FNV_OFFSET
+    var i = 0
+    while i < len {
+        h = h ^ (bytes[i] as i64)
+        h = h * HASH_FNV_PRIME
+        i++
+    }
+    return h
+}
+
+function i64 hash_fnv1a(str text_value) {
+    if text_value == 0 {
+        return HASH_FNV_OFFSET
+    }
+    return hash_fnv1a_bytes(text_value as ptr, string_length(text_value))
+}
+
+// FNV-1a over the 8 native bytes of an integer. Useful for hashing ids.
+function i64 hash_fnv1a_i64(i64 value) {
+    var h = HASH_FNV_OFFSET
+    var remaining = value
+    var i = 0
+    while i < 8 {
+        h = h ^ (remaining & 0xFF)
+        h = h * HASH_FNV_PRIME
+        remaining = remaining >> 8
+        i++
+    }
+    return h
+}
+
+// djb2: cheaper than FNV, weaker distribution. Handy for small string tables.
+function i64 hash_djb2(str text_value) {
+    if text_value == 0 {
+        return 5381
+    }
+    let len = string_length(text_value)
+    let bytes = text_value as ptr
+    var h = 5381
+    var i = 0
+    while i < len {
+        h = ((h << 5) + h) + mem.read8(bytes + i)
+        i++
+    }
+    return h
+}
+
+// CRC-32 (IEEE 802.3, polynomial 0xEDB88320) over a raw buffer.
+function i64 hash_crc32_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var crc = HASH_MASK32
+    var i = 0
+    while i < len {
+        crc = crc ^ (bytes[i] as i64)
+        var bit = 0
+        while bit < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320
+            } else {
+                crc = crc >> 1
+            }
+            bit++
+        }
+        i++
+    }
+    return crc ^ HASH_MASK32
+}
+
+function i64 hash_crc32(str text_value) {
+    if text_value == 0 {
+        return 0
+    }
+    return hash_crc32_bytes(text_value as ptr, string_length(text_value))
+}
+
+// splitmix64 finalizer: avalanches every input bit across the output. This is
+// the step that makes a sequential id usable as a hash table index.
+function i64 hash_mix_i64(i64 value) {
+    var x = value
+    x = x ^ (x >> 33)
+    x = x * HASH_MIX_MUL1
+    x = x ^ (x >> 29)
+    x = x * HASH_MIX_MUL2
+    x = x ^ (x >> 32)
+    return x
+}
+
+// Combine two hashes into one. Order matters, so (a, b) and (b, a) differ.
+function i64 hash_combine(i64 first, i64 second) {
+    return hash_mix_i64(first ^ (hash_mix_i64(second) + 0x9E3779B97F4A7C15))
+}
+
+// The low 32 bits, zero-extended. This is CRC-32's natural width.
+function i64 hash_to_u32(i64 value) {
+    return value & HASH_MASK32
+}
+
+// Map any hash onto [0, buckets). Returns 0 when buckets <= 0 so a bad bucket
+// count cannot divide by zero.
+function i64 hash_bucket(i64 value, int buckets) {
+    if buckets <= 0 {
+        return 0
+    }
+    let mixed = hash_mix_i64(value)
+    // keep the value non-negative before the modulo so the result is never
+    // negative for a negative hash
+    let positive = mixed & 0x7FFFFFFFFFFFFFFF
+    return positive % (buckets as i64)
+}
+
+// Sum of every byte, wrapping at 64 bits. A cheap integrity check, not a hash:
+// it cannot detect reordering.
+function i64 checksum_sum_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var total = 0
+    var i = 0
+    while i < len {
+        total = total + (bytes[i] as i64)
+        i++
+    }
+    return total
+}
+
+// XOR of every byte. Cheap, and sensitive to every byte, but blind to
+// duplicate bytes cancelling out.
+function i64 checksum_xor_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var acc = 0
+    var i = 0
+    while i < len {
+        acc = acc ^ (bytes[i] as i64)
+        i++
+    }
+    return acc
+}
+
+// Adler-32: two running sums mod 65521, combined into 32 bits. Stronger than a
+// plain sum for the same cost.
+function i64 checksum_adler32(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 1
+    }
+    let bytes = data as *u8
+    var a = 1
+    var b = 0
+    var i = 0
+    while i < len {
+        a = (a + (bytes[i] as i64)) % 65521
+        b = (b + a) % 65521
+        i++
+    }
+    return (b << 16) | a
+}
+)SBHASH"},
         {"http", R"SBHTTP(import mem
 
 // HTTP client helpers built on WinHTTP using typed function pointers and zero-copy views.
@@ -828,6 +1772,9 @@ enum HttpUrlOffset {
 enum HttpResponseOffset {
     Status = 0,
     Body = 8,
+    RawHeaders = 16,   // CRLF-separated header block (owned) or 0
+    BodyBytes = 24,    // raw body buffer (owned), binary-safe, NOT null-terminated
+    BodyLen = 32,      // length of BodyBytes in bytes
 }
 
 enum HttpWidePartsOffset {
@@ -847,6 +1794,9 @@ view HttpUrl {
 view HttpResponse {
     status: int @ HttpResponseOffset.Status
     body: str @ HttpResponseOffset.Body
+    raw_headers: str @ HttpResponseOffset.RawHeaders
+    body_bytes: ptr @ HttpResponseOffset.BodyBytes
+    body_len: int @ HttpResponseOffset.BodyLen
 }
 
 view HttpWideParts {
@@ -866,6 +1816,8 @@ using WinHttpQueryHeadersFn = fn(ptr, int, ptr, ptr, ptr, ptr) -> int
 using WinHttpQueryDataAvailableFn = fn(ptr, ptr) -> int
 using WinHttpReadDataFn = fn(ptr, ptr, int, ptr) -> int
 using WinHttpCloseHandleFn = fn(ptr) -> int
+using WinHttpAddRequestHeadersFn = fn(ptr, ptr, int, int) -> int
+using WinHttpSetOptionFn = fn(ptr, int, ptr, int) -> int
 
 function str http_empty_text() {
     return string_substring("", 0, 0)
@@ -908,6 +1860,154 @@ function str http_prefix(str text_value, int slice_len) {
 
 function str http_join2(str left, str right) {
     return string_append(left, right)
+}
+
+function str http_join3(str a, str b, str c) {
+    let ab = string_append(a, b)
+    let abc = string_append(ab, c)
+    free(ab)
+    return abc
+}
+
+function str http_join4(str a, str b, str c, str d) {
+    let ab = string_append(a, b)
+    let abc = string_append(ab, c)
+    let abcd = string_append(abc, d)
+    free(ab)
+    free(abc)
+    return abcd
+}
+
+function int http_hex_digit(int ch) {
+    if ch >= 48 and ch <= 57 {
+        return ch - 48
+    }
+    if ch >= 65 and ch <= 70 {
+        return ch - 55
+    }
+    if ch >= 97 and ch <= 102 {
+        return ch - 87
+    }
+    return -1
+}
+
+function int http_hex_char(int nibble) {
+    if nibble < 10 {
+        return 48 + nibble
+    }
+    return 65 + nibble - 10
+}
+
+// percent-encode for URLs and query values: unreserved (alnum -_.~) pass through
+function int http_url_encoded_len(str text_value) {
+    if text_value == 0 {
+        return 0
+    }
+    let len = string_length(text_value)
+    let p = text_value as ptr
+    var total = 0
+    var i = 0
+    while i < len {
+        let ch = mem.read8(p + i)
+        let unreserved = (ch >= 48 and ch <= 57) or (ch >= 65 and ch <= 90) or
+                         (ch >= 97 and ch <= 122) or ch == 45 or ch == 46 or
+                         ch == 95 or ch == 126
+        if unreserved {
+            total++
+        } else {
+            total += 3
+        }
+        i++
+    }
+    return total
+}
+
+// write the percent-encoded form of text_value at dst+off, return the new offset
+function int http_url_encode_into(ptr dst, int off, str text_value) {
+    if text_value == 0 {
+        return off
+    }
+    let len = string_length(text_value)
+    let p = text_value as ptr
+    var w = off
+    var i = 0
+    while i < len {
+        let ch = mem.read8(p + i)
+        let unreserved = (ch >= 48 and ch <= 57) or (ch >= 65 and ch <= 90) or
+                         (ch >= 97 and ch <= 122) or ch == 45 or ch == 46 or
+                         ch == 95 or ch == 126
+        if unreserved {
+            mem.write8(dst + w, ch)
+            w++
+        } else {
+            mem.write8(dst + w, 37)
+            mem.write8(dst + w + 1, http_hex_char((ch >> 4) & 15))
+            mem.write8(dst + w + 2, http_hex_char(ch & 15))
+            w += 3
+        }
+        i++
+    }
+    return w
+}
+
+function str http_url_encode(str text_value) {
+    if text_value == 0 {
+        return http_empty_text()
+    }
+    let need = http_url_encoded_len(text_value)
+    let out = malloc(need + 1)
+    if out == 0 {
+        return http_empty_text()
+    }
+    let stop = http_url_encode_into(out, 0, text_value)
+    mem.write8(out + stop, 0)
+    let result = make_string(out)
+    free(out)
+    return result
+}
+
+// decode %XX and treat '+' as space
+function str http_url_decode(str text_value) {
+    if text_value == 0 {
+        return http_empty_text()
+    }
+    let len = string_length(text_value)
+    if len == 0 {
+        return http_empty_text()
+    }
+    let p = text_value as ptr
+    let out = malloc(len + 1)
+    if out == 0 {
+        return http_empty_text()
+    }
+    var write_idx = 0
+    var i = 0
+    while i < len {
+        let ch = mem.read8(p + i)
+        if ch == 37 and i + 2 < len {
+            let hi = http_hex_digit(mem.read8(p + i + 1))
+            let lo = http_hex_digit(mem.read8(p + i + 2))
+            if hi >= 0 and lo >= 0 {
+                mem.write8(out + write_idx, hi * 16 + lo)
+                write_idx++
+                i += 3
+                continue
+            }
+        }
+        if ch == 43 {
+            mem.write8(out + write_idx, 32)
+            write_idx++
+            i++
+            continue
+        }
+        mem.write8(out + write_idx, ch)
+        write_idx++
+        i++
+    }
+    mem.write8(out + write_idx, 0)
+    let result = make_string(out)
+    free(out)
+    return result
 }
 
 function int http_find(str text_value, str needle) {
@@ -974,8 +2074,13 @@ function void http_url_free(HttpUrl parsed) {
     free(parsed)
 }
 
+// Response constructors take ownership of the header/body buffers they are
+// given (http_request_send pas)SBHTTP"
+            R"SBHTTP(ses freshly allocated ones). body_text and
+// raw_headers must be heap-owned (or 0); pass a literal and the later
+// http_response_free would hand a PE image pointer to HeapFree.
 function HttpResponse http_response_new(int status, str body_text) {
-    let response = malloc(16) as HttpResponse
+    let response = malloc(40) as HttpResponse
     if response == 0 {
         if body_text != 0 {
             free(body_text)
@@ -984,6 +2089,51 @@ function HttpResponse http_response_new(int status, str body_text) {
     }
     response.status = status
     response.body = body_text
+    response.raw_headers = 0 as str
+    response.body_bytes = 0
+    response.body_len = 0
+    return response
+}
+
+function HttpResponse http_response_new_full(int status, str body_text, str raw_headers) {
+    let response = malloc(40) as HttpResponse
+    if response == 0 {
+        if body_text != 0 {
+            free(body_text)
+        }
+        if raw_headers != 0 {
+            free(raw_headers)
+        }
+        return 0 as HttpResponse
+    }
+    response.status = status
+    response.body = body_text
+    response.raw_headers = raw_headers
+    response.body_bytes = 0
+    response.body_len = 0
+    return response
+}
+
+// like http_response_new_full but also carries a binary-safe body buffer.
+// body_bytes keeps the exact bytes (including embedded NULs) and body_len its
+// length; body_text is a null-terminated view for convenience.
+function HttpResponse http_response_new_binary(int status, ptr body_bytes, int body_len, str raw_headers) {
+    let response = malloc(40) as HttpResponse
+    if response == 0 {
+        if raw_headers != 0 {
+            free(raw_headers)
+        }
+        return 0 as HttpResponse
+    }
+    response.status = status
+    response.raw_headers = raw_headers
+    response.body_bytes = body_bytes
+    response.body_len = body_len
+    if body_bytes != 0 {
+        response.body = make_string(body_bytes)
+    } else {
+        response.body = http_empty_text()
+    }
     return response
 }
 
@@ -1028,6 +2178,12 @@ function void http_response_free(HttpResponse response) {
     }
     if response.body != 0 {
         free(response.body)
+    }
+    if response.raw_headers != 0 {
+        free(response.raw_headers)
+    }
+    if response.body_bytes != 0 {
+        free(response.body_bytes)
     }
     free(response)
 }
@@ -1166,8 +2322,7 @@ function HttpUrl http_parse_url(str url) {
 
     if start >= url_len {
         http_url_free(parsed)
-        return 0 )SBHTTP"
-            R"SBHTTP(as HttpUrl
+        return 0 as HttpUrl
     }
 
     var host_end = start
@@ -1243,7 +2398,8 @@ function int http_query_status(ptr request_handle, ptr query_headers) {
     var status = 0
     let query_fn = query_headers as WinHttpQueryHeadersFn
     // WINHTTP_QUERY_STATUS_CODE (19) | WINHTTP_QUERY_FLAG_NUMBER (0x20000000)
-    let ok = query_fn(request_handle, 19 + 536870912, 0, status_ptr, size_ptr, 0)
+    let ok = query_fn(request_handle, 19 + 536870912,)SBHTTP"
+            R"SBHTTP( 0, status_ptr, size_ptr, 0)
     if ok != 0 {
         status = mem.read32(status_ptr)
     }
@@ -1253,7 +2409,10 @@ function int http_query_status(ptr request_handle, ptr query_headers) {
     return status
 }
 
-function str http_read_body(ptr request_handle, ptr query_data_available, ptr read_data) {
+// Read the full response body into a freshly allocated buffer.
+// Returns the buffer pointer (caller frees) and writes the byte count to
+// len_out. Keeps embedded NULs, so it is safe for binary payloads.
+function ptr http_read_body_bytes(ptr request_handle, ptr query_data_available, ptr read_data, ptr len_out) {
     let available_ptr = mem.make_zero(8)
     let read_count_ptr = mem.make_zero(8)
     var cap = 4096
@@ -1263,7 +2422,8 @@ function str http_read_body(ptr request_handle, ptr query_data_available, ptr re
         if available_ptr != 0 { free(available_ptr) }
         if read_count_ptr != 0 { free(read_count_ptr) }
         if buf != 0 { free(buf) }
-        return http_empty_text()
+        mem.write(len_out, 0)
+        return 0
     }
 
     let query_avail_fn = query_data_available as WinHttpQueryDataAvailableFn
@@ -1317,9 +2477,24 @@ function str http_read_body(ptr request_handle, ptr query_data_available, ptr re
     free(read_count_ptr)
     if failed {
         free(buf)
-        return http_empty_text()
+        mem.write(len_out, 0)
+        return 0
     }
     mem.write8(buf + total_len, 0)
+    mem.write(len_out, total_len)
+    return buf
+}
+
+function str http_read_body(ptr request_handle, ptr query_data_available, ptr read_data) {
+    let len_ptr = mem.make_zero(8)
+    if len_ptr == 0 {
+        return http_empty_text()
+    }
+    let buf = http_read_body_bytes(request_handle, query_data_available, read_data, len_ptr)
+    free(len_ptr)
+    if buf == 0 {
+        return http_empty_text()
+    }
     let out = make_string(buf)
     free(buf)
     return out
@@ -1413,12 +2588,23 @@ function HttpResponse http_fetch(str url) {
     }
 
     let status = http_query_status(request, query_headers_fn)
-    let body = http_read_body(request, query_data_available_fn, read_data_fn)
+    let raw_headers = http_query_raw_headers(request, query_headers_fn)
+    let len_ptr = mem.make_zero(8)
+    var body = 0
+    var body_len = 0
+    if len_ptr != 0 {
+        body = http_read_body_bytes(request, query_data_available_fn, read_data_fn, len_ptr)
+        body_len = mem.read(len_ptr)
+        free(len_ptr)
+    }
 
     http_close_if(close_handle_fn, request)
     http_close_if(close_handle_fn, connection)
     http_close_if(close_handle_fn, session)
-    return http_response_new(status, body)
+    if body == 0 {
+        return http_response_new_full(status, http_empty_text(), raw_headers)
+    }
+    return http_response_new_binary(status, body, body_len, raw_headers)
 }
 
 function int http_debug_fetch_stage(str url) {
@@ -1439,12 +2625,788 @@ function str http_get(str url) {
 
     let body_text = response.body
     response.body = 0 as str
+    if response.raw_headers != 0 {
+        free(response.raw_headers)
+    }
+    if response.body_bytes != 0 {
+        free(response.body_bytes)
+    }
     free(response)
     if body_text == 0 {
-        ret)SBHTTP"
-            R"SBHTTP(urn http_empty_text()
+        return http_empty_text()
     }
     return body_text
+}
+
+// ============================================================================
+// Rich request builder (WinHTTP)
+//
+// http_request_new() returns a heap HttpRequest block. Setters copy their
+// arguments, so callers keep ownership of anything they pass in. Send with
+// http_request_send(), which returns an HttpResponse carrying status, body and
+// the raw CRLF header block (queryable via http_response_header).
+// ============================================================================
+
+enum HttpRequestOffset {
+    Method = 0,           // str
+    Url = 8,              // str
+    HeaderBuf = 16,       // ptr raw "Name: Value\r\n..." text
+    HeaderLen = 24,       // int
+    HeaderCap = 32,       // int
+    Body = 40,            // ptr raw bytes
+    BodyLen = 48,         // int
+    ContentType = 56,     // str
+    UserAgent = 64,      )SBHTTP"
+            R"SBHTTP( // str
+    TimeoutMs = 72,       // int
+    FollowRedirects = 80, // int (bool)
+}
+
+enum HttpRequestSize { RequestBytes = 88 }
+
+view HttpRequest {
+    method: str @ HttpRequestOffset.Method
+    url: str @ HttpRequestOffset.Url
+    header_buf: ptr @ HttpRequestOffset.HeaderBuf
+    header_len: int @ HttpRequestOffset.HeaderLen
+    header_cap: int @ HttpRequestOffset.HeaderCap
+    body: ptr @ HttpRequestOffset.Body
+    body_len: int @ HttpRequestOffset.BodyLen
+    content_type: str @ HttpRequestOffset.ContentType
+    user_agent: str @ HttpRequestOffset.UserAgent
+    timeout_ms: int @ HttpRequestOffset.TimeoutMs
+    follow_redirects: int @ HttpRequestOffset.FollowRedirects
+}
+
+function str http_dup(str text_value) {
+    if text_value == 0 {
+        return 0 as str
+    }
+    return string_substring(text_value, 0, string_length(text_value))
+}
+
+// Grow a heap buffer so it can hold `used + add_len + 1` bytes, copying
+// existing bytes. Returns the (possibly reallocated) pointer.
+function ptr http_buf_reserve(ptr buf, int used, int cap, int add_len) {
+    var need = used + add_len
+    if need + 1 <= cap {
+        return buf
+    }
+    var new_cap = cap
+    if new_cap < 16 {
+        new_cap = 16
+    }
+    while new_cap < need + 1 {
+        new_cap = new_cap * 2
+    }
+    let next = malloc(new_cap + 1)
+    if next == 0 {
+        return buf
+    }
+    if used > 0 {
+        memcpy(next, buf, used)
+    }
+    free(buf)
+    mem.write8(next + used, 0)
+    return next
+}
+
+function int http_buf_new_cap(int used, int cap, int add_len) {
+    var need = used + add_len
+    if need + 1 <= cap {
+        return cap
+    }
+    var new_cap = cap
+    if new_cap < 16 {
+        new_cap = 16
+    }
+    while new_cap < need + 1 {
+        new_cap = new_cap * 2
+    }
+    return new_cap
+}
+
+function HttpRequest http_request_new(str method, str url) {
+    let req = mem.make_zero(HttpRequestSize.RequestBytes) as HttpRequest
+    if req == 0 {
+        return 0 as HttpRequest
+    }
+    req.method = http_dup(method)
+    req.url = http_dup(url)
+    req.header_buf = malloc(64)
+    req.header_len = 0
+    req.header_cap = 64
+    req.body = 0
+    req.body_len = 0
+    req.content_type = 0 as str
+    req.user_agent = 0 as str
+    req.timeout_ms = 30000
+    req.follow_redirects = 1
+    if req.header_buf != 0 {
+        mem.write8(req.header_buf, 0)
+    }
+    return req
+}
+
+function void http_request_header(HttpRequest req, str name, str value) {
+    if req == 0 or req.header_buf == 0 {
+        return
+    }
+    let line = http_join4(name, ": ", value, "\r\n")
+    let line_len = string_length(line)
+    let new_cap = http_buf_new_cap(req.header_len, req.header_cap, line_len)
+    let grown = http_buf_reserve(req.header_buf, req.header_len, req.header_cap, line_len)
+    req.header_buf = grown
+    req.header_cap = new_cap
+    if grown == 0 {
+        free(line)
+        return
+    }
+    memcpy(grown + req.header_len, line as ptr, line_len)
+    req.header_len = req.header_len + line_len
+    mem.write8(grown + req.header_len, 0)
+    free(line)
+}
+
+function void http_request_body(HttpRequest req, ptr bytes, int len, str content_type) {
+    if req == 0 {
+        return
+    }
+    if req.body != 0 {
+        free(req.body)
+        req.body = 0
+    }
+    if bytes != 0 and len > 0 {
+        req.body = mem.make_copy(bytes, len)
+        req.body_len = len
+    } else {
+        req.body_len = 0
+    }
+    if req.content_type != 0 {
+        free(req.content_type)
+    }
+    req.content_type = http_dup(content_type)
+}
+
+function void http_request_body_text(HttpRequest req, str text_value, str content_type) {
+    if req == 0 {
+        return
+    }
+    if text_value == 0 {
+        http_request_body(req, 0, 0, content_type)
+        return
+    }
+    http_request_body(req, text_value as ptr, string_length(text_value), content_type)
+}
+
+function void http_request_user_agent(HttpRequest req, str agent) {
+    if req == 0 {
+        return
+    }
+    if req.user_agent != 0 {
+        free(req.user_agent)
+    }
+    req.user_agent = http_dup(agent)
+}
+
+function void http_request_timeout(HttpRequest req, int ms) {
+    if req == 0 {
+        return
+    }
+    req.timeout_ms = ms
+}
+
+function void http_request_follow_redirects(HttpRequest req, bool follow) {
+    if req == 0 {
+        return
+    }
+    if follow {
+        req.follow_redirects = 1
+    } else {
+        req.follow_redirects = 0
+    }
+}
+
+function void http_request_free(HttpRequest req) {
+    if req == 0 {
+        return
+    }
+    if req.method != 0 {
+        free(req.method)
+    }
+    if req.url != 0 {
+        free(req.url)
+    }
+    if req.header_buf != 0 {
+        free(req.header_buf)
+    }
+    if req.body != 0 {
+        free(req.body)
+    }
+    if req.content_type != 0 {
+        free(req.content_type)
+    }
+    if req.user_agent != 0 {
+        free(req.user_agent)
+    }
+    free(req)
+}
+
+// ============================================================================
+// Send / response
+// ============================================================================
+
+function str http_query_raw_headers(ptr request_handle, ptr query_headers) {
+    let size_ptr = mem.make_zero(8)
+    if size_ptr == 0 {
+        return 0 as str
+    }
+    mem.write32(size_ptr, 0)
+    let query_fn = query_headers as WinHttpQueryHeadersFn
+    // WINHTTP_QUERY_RAW_HEADERS_CRLF = 22. The exported WinHttpQueryHeaders here
+    // is the wide (UTF-16) variant, so the length it returns is a WCHAR count.
+    var ok = query_fn(request_handle, 22, 0, 0, size_ptr, 0)
+    let needed = mem.read32(size_ptr)
+    if needed <= 0 {
+        free(size_ptr)
+        return 0 as str
+    }
+    let wide = malloc(needed * 2 + 2)
+    if wide == 0 {
+        free(size_ptr)
+        return 0 as str
+    }
+    mem.write32(size_ptr, needed)
+    ok = query_fn(request_handle, 22, 0, wide, size_ptr, 0)
+    free(size_ptr)
+    if ok == 0 {
+        free(wide)
+        return 0 as str
+    }
+    // downconvert UTF-16 -> ASCII (header text is ASCII/ISO-8859-1)
+    let out = malloc(needed + 1)
+    if out == 0 {
+        free(wide)
+        return 0 as str
+    }
+    var i = 0
+    var w = 0
+    while i < needed {
+        let lo = mem.read8(wide + i * 2)
+        let hi = mem.read8(wide + i * 2 + 1)
+        if lo == 0 and hi == 0 {
+            break
+        }
+        mem.write8(out + w, lo)
+        w++
+        i++
+    }
+    mem.write8(out + w, 0)
+    let result = make_string(out)
+    free(out)
+    free(wide)
+    return result
+}
+
+function HttpResponse http_request_send(HttpRequest req) {
+    if req == 0 or req.url == 0 {
+        return http_fail_response()
+    }
+
+    let parsed = http_parse_url(req.url)
+    if parsed == 0 {
+        return http_fail_response()
+    }
+
+    let module_handle = load_library("winhttp.dll")
+    if module_handle == 0 {
+        http_url_free(parsed)
+        return http_fail_response()
+    }
+
+    let open_fn = get_proc(module_handle, "WinHttpOpen")
+    let connect_fn = get_proc(module_handle, "WinHttpConnect")
+    let open_request_fn = get_proc(module_handle, "WinHttpOpenRequest")
+    let send_request_fn = get_proc(module_handle, "WinHttpSendRequest")
+    let receive_response_fn = get_proc(module_handle, "WinHttpReceiveResponse")
+    let query_data_available_fn = get_proc(module_handle, "WinHttpQueryDataAvailable")
+    let query_headers_fn = get_proc(module_handle, "WinHttpQueryHeaders")
+    let read_data_fn = get_proc(module_handle, "WinHttpReadData")
+    let set_timeouts_fn = get_proc(module_handle, "WinHttpSetTimeouts")
+    let close_handle_fn = get_proc(module_handle, "WinHttpCloseHandle")
+    let set_option_fn = get_proc(module_handle, "WinHttpSetOption")
+
+    if open_fn == 0 or connect_fn == 0 or open_request_fn == 0 or send_request_fn == 0 or
+       receive_response_fn == 0 or query_data_available_fn == 0 or query_headers_fn == 0 or
+       read_data_fn == 0 or set_timeouts_fn == 0 or close_handle_fn == 0 {
+        http_url_free(parsed)
+        return http_fail_response()
+    }
+
+    let host_w = http_url_host_utf16(parsed)
+    let method_w = http_utf16z(req.method)
+    let path_w = http_url_path_utf16(parsed)
+    if host_w == 0 or method_w == 0 or path_w == 0 {
+        if host_w != 0 { free(host_w) }
+        if method_w != 0 {)SBHTTP"
+            R"SBHTTP( free(method_w) }
+        if path_w != 0 { free(path_w) }
+        http_url_free(parsed)
+        return http_fail_response()
+    }
+
+    let session = http_open_session(open_fn, set_timeouts_fn)
+    if session == 0 {
+        free(host_w)
+        free(method_w)
+        free(path_w)
+        http_url_free(parsed)
+        return http_fail_response()
+    }
+
+    if req.timeout_ms > 0 {
+        let winhttp_set_timeouts = set_timeouts_fn as WinHttpSetTimeoutsFn
+        winhttp_set_timeouts(session, req.timeout_ms, req.timeout_ms, req.timeout_ms, req.timeout_ms)
+    }
+
+    // WINHTTP_OPTION_REDIRECT_POLICY = 88; values: 0 = never,
+    // 1 = disallow https->http, 2 = always follow. Default is 2.
+    if set_option_fn != 0 {
+        let policy = mem.make_zero(4)
+        if policy != 0 {
+            if req.follow_redirects != 0 {
+                mem.write32(policy, 2)
+            } else {
+                mem.write32(policy, 0)
+            }
+            let winhttp_set_option = set_option_fn as WinHttpSetOptionFn
+            winhttp_set_option(session, 88, policy, 4)
+            free(policy)
+        }
+    }
+
+    let winhttp_connect = connect_fn as WinHttpConnectFn
+    let connection = winhttp_connect(session, host_w, parsed.port, 0)
+    free(host_w)
+    if connection == 0 {
+        free(method_w)
+        free(path_w)
+        http_close_if(close_handle_fn, session)
+        http_url_free(parsed)
+        return http_fail_response()
+    }
+
+    var request_flags = 0
+    if parsed.secure != 0 {
+        request_flags = 8388608 // WINHTTP_FLAG_SECURE
+    }
+
+    let winhttp_open_req = open_request_fn as WinHttpOpenRequestFn
+    let request = winhttp_open_req(connection, method_w, path_w, 0, 0, 0, request_flags)
+    free(method_w)
+    free(path_w)
+    http_url_free(parsed)
+
+    if request == 0 {
+        http_close_if(close_handle_fn, connection)
+        http_close_if(close_handle_fn, session)
+        return http_fail_response()
+    }
+
+    // Build the full wide (UTF-16) header block: accumulated headers plus a
+    // Content-Type line when a body type was set. WinHttpSendRequest takes this
+    // as lpszHeaders with dwHeadersLength = -1 (0xFFFFFFFF, null-terminated).
+    var headers_w = 0
+    var headers_present = 0
+    if req.header_len > 0 or (req.content_type != 0 and string_length(req.content_type) > 0) {
+        var ct_line = ""
+        if req.content_type != 0 and string_length(req.content_type) > 0 {
+            ct_line = http_join4("Content-Type", ": ", req.content_type, "\r\n")
+        }
+        let block = string_append(req.header_buf as str, ct_line)
+        if string_length(ct_line) > 0 {
+            free(ct_line)
+        }
+        headers_w = http_utf16z(block)
+        free(block)
+        if headers_w != 0 {
+            headers_present = 1
+        }
+    }
+
+    let winhttp_send = send_request_fn as WinHttpSendRequestFn
+    let winhttp_recv = receive_response_fn as WinHttpReceiveResponseFn
+
+    var send_ok = 0
+    if headers_present != 0 {
+        if req.body != 0 and req.body_len > 0 {
+            send_ok = winhttp_send(request, headers_w, 0 as int - 1, req.body, req.body_len, req.body_len, 0)
+        } else {
+            send_ok = winhttp_send(request, headers_w, 0 as int - 1, 0, 0, 0, 0)
+        }
+    } else {
+        if req.body != 0 and req.body_len > 0 {
+            send_ok = winhttp_send(request, 0, 0, req.body, req.body_len, req.body_len, 0)
+        } else {
+            send_ok = winhttp_send(request, 0, 0, 0, 0, 0, 0)
+        }
+    }
+    if headers_w != 0 {
+        free(headers_w)
+    }
+
+    if send_ok == 0 or winhttp_recv(request, 0) == 0 {
+        http_close_if(close_handle_fn, request)
+        http_close_if(close_handle_fn, connection)
+        http_close_if(close_handle_fn, session)
+        return http_fail_response()
+    }
+
+    let status = http_query_status(request, query_headers_fn)
+    let raw_headers = http_query_raw_headers(request, query_headers_fn)
+    let body_len_ptr = mem.make_zero(8)
+    var body_bytes = 0
+    var body_len = 0
+    if body_len_ptr != 0 {
+        body_bytes = http_read_body_bytes(request, query_data_available_fn, read_data_fn, body_len_ptr)
+        body_len = mem.read(body_len_ptr)
+        free(body_len_ptr)
+    }
+
+    http_close_if(close_handle_fn, request)
+    http_close_if(close_handle_fn, connection)
+    http_close_if(close_handle_fn, session)
+
+    if body_bytes == 0 {
+        return http_response_new_full(status, http_empty_text(), raw_headers)
+    }
+    return http_response_new_binary(status, body_bytes, body_len, raw_headers)
+}
+
+// ============================================================================
+// Response header lookup (case-insensitive)
+// ============================================================================
+
+function int http_ascii_lower(int ch) {
+    if ch >= 65 and ch <= 90 {
+        return ch + 32
+    }
+    return ch
+}
+
+function bool http_header_name_eq(str block, int start, int name_len, str name) {
+    if string_length(name) != name_len {
+        return false
+    }
+    let bp = block as ptr
+    let np = name as ptr
+    var i = 0
+    while i < name_len {
+        if http_ascii_lower(mem.read8(bp + start + i)) != http_ascii_lower(mem.read8(np + i)) {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+// find "name: value" inside a CRLF header block, return value with surrounding
+// spaces trimmed. Result is a heap string (caller frees) or 0 when absent.
+function str http_header_find(str block, str name) {
+    if block == 0 or name == 0 {
+        return 0 as str
+    }
+    let len = string_length(block)
+    let name_len = string_length(name)
+    if len == 0 or name_len == 0 {
+        return 0 as str
+    }
+    let bp = block as ptr
+    var line_start = 0
+    while line_start < len {
+        // find end of this line
+        var line_end = line_start
+        while line_end < len and mem.read8(bp + line_end) != 13 {
+            line_end++
+        }
+        // does "name:" start this line?
+        if line_end - line_start > name_len and
+           http_header_name_eq(block, line_start, name_len, name) and
+           mem.read8(bp + line_start + name_len) == 58 {
+            var value_start = line_start + name_len + 1
+            // skip leading spaces/tabs
+            while value_start < line_end and (mem.read8(bp + value_start) == 32 or mem.read8(bp + value_start) == 9) {
+                value_start++
+            }
+            var value_end = line_end
+            while value_end > value_start and (mem.read8(bp + value_end - 1) == 32 or mem.read8(bp + value_end - 1) == 9) {
+                value_end--
+            }
+            if value_end <= value_start {
+                return http_empty_text()
+            }
+            return string_substring(block, value_start, value_end - value_start)
+        }
+        // advance past CRLF
+        line_start = line_end
+        if line_start < len and mem.read8(bp + line_start) == 13 {
+            line_start++
+        }
+        if line_start < len and mem.read8(bp + line_start) == 10 {
+            line_start++
+        }
+    }
+    return 0 as str
+}
+
+function str http_response_header(HttpResponse response, str name) {
+    if response == 0 or response.raw_headers == 0 {
+        return 0 as str
+    }
+    return http_header_find(response.raw_headers, name)
+}
+
+function str http_response_content_type(HttpResponse response) {
+    let ct = http_response_header(response, "Content-Type")
+    if ct == 0 {
+        return http_empty_text()
+    }
+    return ct
+}
+
+// ============================================================================
+// Verb convenience helpers
+// ============================================================================
+
+function HttpResponse http_request(str method, str url) {
+    let req = http_request_new(method, url)
+    if req == 0 {
+        return http_fail_response()
+    }
+    let response = http_request_send(req)
+    http_request_free(req)
+    return response
+}
+
+function HttpResponse http_post(str url, str content_type, str body_text) {
+    let req = http_request_new("POST", url)
+    if req == 0 {
+        return http_fail_response()
+    }
+    http_request_body_text(req, body_text, content_type)
+    let respons)SBHTTP"
+            R"SBHTTP(e = http_request_send(req)
+    http_request_free(req)
+    return response
+}
+
+function HttpResponse http_put(str url, str content_type, str body_text) {
+    let req = http_request_new("PUT", url)
+    if req == 0 {
+        return http_fail_response()
+    }
+    http_request_body_text(req, body_text, content_type)
+    let response = http_request_send(req)
+    http_request_free(req)
+    return response
+}
+
+function HttpResponse http_patch(str url, str content_type, str body_text) {
+    let req = http_request_new("PATCH", url)
+    if req == 0 {
+        return http_fail_response()
+    }
+    http_request_body_text(req, body_text, content_type)
+    let response = http_request_send(req)
+    http_request_free(req)
+    return response
+}
+
+function HttpResponse http_delete(str url) {
+    return http_request("DELETE", url)
+}
+
+function HttpResponse http_head(str url) {
+    return http_request("HEAD", url)
+}
+
+// build a query string from parallel key/value arrays; values are percent-encoded
+function str http_build_query(ptr keys, ptr values, int count) {
+    if count <= 0 {
+        return http_empty_text()
+    }
+    // first pass: total length
+    var total = 0
+    var i = 0
+    while i < count {
+        let key = mem.read(keys + i * 8) as str
+        let value = mem.read(values + i * 8) as str
+        total += http_url_encoded_len(key) + 1 + http_url_encoded_len(value)
+        if i < count - 1 {
+            total += 1
+        }
+        i++
+    }
+    let out = malloc(total + 1)
+    if out == 0 {
+        return http_empty_text()
+    }
+    var w = 0
+    i = 0
+    while i < count {
+        let key = mem.read(keys + i * 8) as str
+        let value = mem.read(values + i * 8) as str
+        w = http_url_encode_into(out, w, key)
+        mem.write8(out + w, 61) // =
+        w++
+        w = http_url_encode_into(out, w, value)
+        if i < count - 1 {
+            mem.write8(out + w, 38) // &
+            w++
+        }
+        i++
+    }
+    mem.write8(out + w, 0)
+    let result = make_string(out)
+    free(out)
+    return result
+}
+
+
+// ============================================================================
+// Additional request helpers: query appending, base64/basic auth, multipart
+// ============================================================================
+
+// append "?k=v" (or "&k=v" when the url already has a query) to a url.
+// key and value are percent-encoded. Returns a new heap string.
+function str http_url_with_query(str url, str key, str value) {
+    if url == 0 {
+        return http_empty_text()
+    }
+    var sep = "?"
+    if http_find(url, "?") >= 0 {
+        sep = "&"
+    }
+    let ek = http_url_encode(key)
+    let ev = http_url_encode(value)
+    let result = http_join4(url, sep, ek, http_join2("=", ev))
+    free(ek)
+    free(ev)
+    return result
+}
+
+function str http_request_add_query(HttpRequest req, str key, str value) {
+    if req == 0 or req.url == 0 {
+        return 0 as str
+    }
+    let next_url = http_url_with_query(req.url, key, value)
+    if next_url == 0 {
+        return 0 as str
+    }
+    free(req.url)
+    req.url = next_url
+    return next_url
+}
+
+enum HttpBase64Chars { Alphabet = 0 }
+
+function int http_base64_char(int index) {
+    // standard alphabet: A-Z a-z 0-9 + /
+    if index < 26 {
+        return 65 + index
+    }
+    if index < 52 {
+        return 97 + (index - 26)
+    }
+    if index < 62 {
+        return 48 + (index - 52)
+    }
+    if index == 62 {
+        return 43
+    }
+    return 47
+}
+
+// base64-encode raw bytes; returns a heap string (caller frees)
+function str http_base64_encode(ptr bytes, int len) {
+    if bytes == 0 or len <= 0 {
+        return http_empty_text()
+    }
+    let groups = (len + 2) / 3
+    let out = malloc(groups * 4 + 1)
+    if out == 0 {
+        return http_empty_text()
+    }
+    var w = 0
+    var i = 0
+    while i < len {
+        let b0 = mem.read8(bytes + i)
+        var b1 = 0
+        var b2 = 0
+        let have1 = i + 1 < len
+        let have2 = i + 2 < len
+        if have1 {
+            b1 = mem.read8(bytes + i + 1)
+        }
+        if have2 {
+            b2 = mem.read8(bytes + i + 2)
+        }
+        mem.write8(out + w, http_base64_char((b0 >> 2) & 63))
+        mem.write8(out + w + 1, http_base64_char(((b0 & 3) << 4) | ((b1 >> 4) & 15)))
+        if have1 {
+            mem.write8(out + w + 2, http_base64_char(((b1 & 15) << 2) | ((b2 >> 6) & 3)))
+        } else {
+            mem.write8(out + w + 2, 61) // '='
+        }
+        if have2 {
+            mem.write8(out + w + 3, http_base64_char(b2 & 63))
+        } else {
+            mem.write8(out + w + 3, 61) // '='
+        }
+        w += 4
+        i += 3
+    }
+    mem.write8(out + w, 0)
+    let result = make_string(out)
+    free(out)
+    return result
+}
+
+function str http_basic_auth(str username, str password) {
+    let joined = http_join3(username, ":", password)
+    let token = http_base64_encode(joined as ptr, string_length(joined))
+    let header = http_join2("Basic ", token)
+    free(joined)
+    free(token)
+    return header
+}
+
+// set an Authorization: Basic ... header from credentials
+function void http_request_basic_auth(HttpRequest req, str username, str password) {
+    if req == 0 {
+        return
+    }
+    let value = http_basic_auth(username, password)
+    http_request_header(req, "Authorization", value)
+    free(value)
+}
+
+// build a multipart/form-data body with a single text field. Pair it with
+// http_multipart_content_type(boundary) for the Content-Type header.
+// Caller frees the returned body.
+function str http_multipart_field(str field_name, str value, str boundary) {
+    let part = http_join4("--", boundary, "\r\nContent-Disposition: form-data; name=\"", field_name)
+    let part2 = http_join3("\"\r\n\r\n", value, "\r\n")
+    let closing = http_join3("--", boundary, "--\r\n")
+    let body = http_join3(part, part2, closing)
+    free(part)
+    free(part2)
+    free(closing)
+    return body
+}
+
+function str http_multipart_content_type(str boundary) {
+    return http_join2("multipart/form-data; boundary=", boundary)
 }
 )SBHTTP"},
         {"json", R"SBJSON(import ascii
@@ -2750,6 +4712,652 @@ function bool json_has_key(str source, str key_name) {
     return json_find_value_start(source, key_name) >= 0
 }
 )SBJSON"},
+        {"math", R"SBMATH(// Integer mathematics: number theory, integer roots, and overflow-checked
+// arithmetic. Everything operates on i64 and is pure - nothing allocates.
+//
+// The checked_* helpers detect overflow and return a defined value instead of
+// wrapping silently, which is what you want for a validation path.
+
+// ---- number theory ---------------------------------------------------------
+
+// greatest common divisor, always non-negative. gcd(0, 0) is 0.
+function i64 math_gcd(i64 a, i64 b) {
+    var x = a
+    var y = b
+    if x < 0 {
+        x = 0 - x
+    }
+    if y < 0 {
+        y = 0 - y
+    }
+    while y != 0 {
+        let t = x % y
+        x = y
+        y = t
+    }
+    return x
+}
+
+// least common multiple; 0 when either argument is 0. gcd of 0/0 is 0 so the
+// division is guarded.
+function i64 math_lcm(i64 a, i64 b) {
+    let g = math_gcd(a, b)
+    if g == 0 {
+        return 0
+    }
+    var x = a
+    var y = b
+    if x < 0 {
+        x = 0 - x
+    }
+    if y < 0 {
+        y = 0 - y
+    }
+    return (x / g) * y
+}
+
+// Euclidean positive modulo: the result is always in [0, abs(m)). unlike the `%`
+// operator, (-1) %% 3 is 2 rather than -1. zero modulus yields 0.
+//
+// note: written as a single conditional adjustment rather than a re-tested nested
+// `if`, because a repeated condition on a mutated variable miscompiles on this
+// toolchain (see the "return of a register-bound local after a nested if" bug in
+// the handoff). one `if` with an absolute modulus is both correct and clear.
+function i64 math_mod(i64 value, i64 m) {
+    if m == 0 {
+        return 0
+    }
+    var modulus = m
+    if modulus < 0 {
+        modulus = 0 - modulus
+    }
+    var r = value % modulus
+    if r < 0 {
+        r = r + modulus
+    }
+    return r
+}
+
+// modular exponentiation: (base ^ exp) mod m, computed without overflow for a
+// positive modulus. returns 0 for a non-positive modulus.
+function i64 math_pow_mod(i64 base, i64 exp, i64 m) {
+    if m <= 0 {
+        return 0
+    }
+    var result = 1 % m
+    var b = math_mod(base, m)
+    var e = exp
+    while e > 0 {
+        if (e & 1) != 0 {
+            result = (result * b) % m
+        }
+        e = e >> 1
+        if e > 0 {
+            b = (b * b) % m
+        }
+    }
+    return result
+}
+
+// extended Euclid: writes the Bezout coefficients x, y with a*x + b*y = gcd(a,b)
+// into the two out pointers (which may be null). returns the gcd.
+function i64 math_ext_gcd(i64 a, i64 b, *i64 x, *i64 y) {
+    var old_r = a
+    var r = b
+    var old_s = 1
+    var s = 0
+    var old_t = 0
+    var t = 1
+    while r != 0 {
+        let q = old_r / r
+        let nr = old_r - q * r
+        old_r = r
+        r = nr
+        let ns = old_s - q * s
+        old_s = s
+        s = ns
+        let nt = old_t - q * t
+        old_t = t
+        t = nt
+    }
+    if x != 0 {
+        x[0] = old_s
+    }
+    if y != 0 {
+        y[0] = old_t
+    }
+    return old_r
+}
+
+// ---- roots and powers ------------------------------------------------------
+
+// integer square root, floor(sqrt(n)). negative input yields 0.
+function i64 math_isqrt(i64 n) {
+    if n <= 0 {
+        return 0
+    }
+    // Newton's method on integers, seeded by a bit-length estimate
+    var x = n
+    var y = (x + 1) / 2
+    while y < x {
+        x = y
+        y = (x + n / x) / 2
+    }
+    return x
+}
+
+// true when n is a perfect square (n >= 0)
+function bool math_is_square(i64 n) {
+    if n < 0 {
+        return false
+    }
+    let r = math_isqrt(n)
+    return r * r == n
+}
+
+// integer n-th root, floor(n^(1/k)). k < 1 or n < 0 yields 0. uses binary search
+// so it cannot overflow on the multiply.
+function i64 math_nth_root(i64 n, i64 k) {
+    if n < 0 || k < 1 {
+        return 0
+    }
+    if n < 2 || k == 1 {
+        return n
+    }
+    var low = 0
+    var high = n
+    var best = 0
+    while low <= high {
+        let mid = low + (high - low) / 2
+        if mid == 0 {
+            break
+        }
+        // compare mid^k with n without overflowing: multiply with a guard
+        var power = 1
+        var overflowed = false
+        var i = 0
+        while i < k {
+            if power > n / mid {
+                overflowed = true
+                break
+            }
+            power = power * mid
+            i++
+        }
+        if overflowed || power > n {
+            high = mid - 1
+        } else {
+            best = mid
+            low = mid + 1
+        }
+    }
+    return best
+}
+
+// integer power: base^exp, wrapping on overflow (use math_checked_pow to detect)
+function i64 math_ipow(i64 base, i64 exp) {
+    var result = 1
+    var b = base
+    var e = exp
+    if e < 0 {
+        return 0
+    }
+    while e > 0 {
+        if (e & 1) != 0 {
+            result = result * b
+        }
+        e = e >> 1
+        if e > 0 {
+            b = b * b
+        }
+    }
+    return result
+}
+
+// ---- sequences -------------------------------------------------------------
+
+// factorial of n (n!); 0! and 1! are 1. negative input is 0. wraps on overflow.
+function i64 math_factorial(i64 n) {
+    if n < 0 {
+        return 0
+    }
+    var result = 1
+    var i = 2
+    while i <= n {
+        result = result * i
+        i++
+    }
+    return result
+}
+
+// binomial coefficient C(n, k), computed multiplicatively to stay small.
+// returns 0 when k is out of range.
+function i64 math_binomial(i64 n, i64 k) {
+    if n < 0 || k < 0 || k > n {
+        return 0
+    }
+    var kk = k
+    if kk > n - kk {
+        kk = n - kk
+    }
+    var result = 1
+    var i = 0
+    while i < kk {
+        result = (result * (n - i)) / (i + 1)
+        i++
+    }
+    return result
+}
+
+// the n-th Fibonacci number with F(0)=0, F(1)=1. wraps past n=92.
+function i64 math_fibonacci(i64 n) {
+    if n <= 0 {
+        return 0
+    }
+    var a = 0
+    var b = 1
+    var i = 1
+    while i < n {
+        let next = a + b
+        a = b
+        b = next
+        i++
+    }
+    return b
+}
+
+// ---- overflow-checked arithmetic -------------------------------------------
+
+// a + b, or `fallback` when the sum overflows i64
+function i64 math_checked_add(i64 a, i64 b, i64 fallback) {
+    if b > 0 && a > 9223372036854775807 - b {
+        return fallback
+    }
+    if b < 0 && a < (0 - 9223372036854775807 - 1) - b {
+        return fallback
+    }
+    return a + b
+}
+
+// a - b, or `fallback` when the difference overflows i64
+function i64 math_checked_sub(i64 a, i64 b, i64 fallback) {
+    if b > 0 && a < (0 - 9223372036854775807 - 1) + b {
+        return fallback
+    }
+    if b < 0 && a > 9223372036854775807 + b {
+        return fallback
+    }
+    return a - b
+}
+
+// a * b, or `fallback` when the product overflows i64
+function i64 math_checked_mul(i64 a, i64 b, i64 fallback) {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    // MIN * -1 and MIN * 1 are the only cases the divide-back check mishandles
+    let min = 0 - 9223372036854775807 - 1
+    if (a == min && b == 0 - 1) || (b == min && a == 0 - 1) {
+        return fallback
+    }
+    let product = a * b
+    if product / a != b {
+        return fallback
+    }
+    return product
+}
+
+// clamp `value` into [lo, hi]; if lo > hi the bounds are swapped
+function i64 math_clamp(i64 value, i64 lo, i64 hi) {
+    var low = lo
+    var high = hi
+    if low > high {
+        low = hi
+        high = lo
+    }
+    if value < low {
+        return low
+    }
+    if value > high {
+        return high
+    }
+    return value
+}
+)SBMATH"},
+        {"matrix", R"SBMATRIX(import mem
+
+// Dense matrix of 64-bit signed integers, stored row-major in one contiguous block.
+//
+// A binder block is malloc'd, so the layout is a view over the header rather than a
+// struct (struct fields would be inline, not an overlay):
+//   [0]  data  -> heap block of rows*cols cells, row-major
+//   [8]  rows
+//   [16] cols
+//   [24] flags (reserved)
+//
+// Ownership: matrix_new / matrix_zeros / matrix_identity / matrix_clone allocate; the caller
+// owns the handle and releases it with matrix_free. Every other function borrows.
+//
+// Element access is bounds-checked; an out-of-range read yields 0 and a write is
+// ignored, so a bad index can never fault.
+
+view Matrix {
+    data: ptr @ 0
+    rows: int @ 8
+    cols: int @ 16
+    flags: int @ 24
+}
+
+function Matrix matrix_alloc_handle() {
+    var handle = malloc(32) as Matrix
+    if handle != 0 {
+        handle.data = 0
+        handle.rows = 0
+        handle.cols = 0
+        handle.flags = 0
+    }
+    return handle
+}
+
+// rows and cols below 1 give a null handle, never a malformed matrix
+function Matrix matrix_new(int rows, int cols) {
+    var handle = 0 as Matrix
+    if rows > 0 && cols > 0 {
+        let block = mem.make_zero(rows * cols * 8)
+        if block != 0 {
+            let made = matrix_alloc_handle()
+            if made != 0 {
+                made.data = block
+                made.rows = rows
+                made.cols = cols
+            } else {
+                free(block)
+            }
+            handle = made
+        }
+    }
+    return handle
+}
+
+function Matrix matrix_zeros(int rows, int cols) => matrix_new(rows, cols)
+
+function Matrix matrix_identity(int n) {
+    let m = matrix_new(n, n)
+    if m != 0 {
+        for i in range(0, n) {
+            matrix_set(m, i, i, 1)
+        }
+    }
+    return m
+}
+
+function Matrix matrix_clone(Matrix src) {
+    var handle = 0 as Matrix
+    if src != 0 {
+        let block = mem.make_copy(src.data, src.rows * src.cols * 8)
+        if block != 0 {
+            let made = matrix_alloc_handle()
+            if made != 0 {
+                made.data = block
+                made.rows = src.rows
+                made.cols = src.cols
+            } else {
+                free(block)
+            }
+            handle = made
+        }
+    }
+    return handle
+}
+
+function void matrix_free(Matrix m) {
+    if m == 0 {
+        return
+    }
+    if m.data != 0 {
+        free(m.data)
+        m.data = 0
+    }
+    free(m)
+}
+
+function int matrix_rows(Matrix m) {
+    if m == 0 {
+        return 0
+    }
+    return m.rows
+}
+
+function int matrix_cols(Matrix m) {
+    if m == 0 {
+        return 0
+    }
+    return m.cols
+}
+
+function bool matrix_is_empty(Matrix m) => matrix_rows(m) <= 0 || matrix_cols(m) <= 0
+
+function bool matrix_is_square(Matrix m) => m != 0 && m.rows > 0 && m.rows == m.cols
+
+function bool matrix_same_shape(Matrix a, Matrix b) =>
+    a != 0 && b != 0 && a.rows == b.rows && a.cols == b.cols
+
+function bool matrix_in_bounds(Matrix m, int r, int c) =>
+    m != 0 && r >= 0 && r < m.rows && c >= 0 && c < m.cols
+
+// element read; an out-of-range cell reads 0
+function long matrix_get(Matrix m, int r, int c) {
+    if !matrix_in_bounds(m, r, c) {
+        return 0
+    }
+    let cells = m.data as *long
+    return cells[r * m.cols + c]
+}
+
+// element write; an out-of-range cell is ignored
+function void matrix_set(Matrix m, int r, int c, long value) {
+    if !matrix_in_bounds(m, r, c) {
+        return
+    }
+    let cells = m.data as *long
+    cells[r * m.cols + c] = value
+}
+
+function void matrix_fill(Matrix m, long value) {
+    if m == 0 || m.data == 0 {
+        return
+    }
+    let cells = m.data as *long
+    let total = m.rows * m.cols
+    for i in range(0, total) {
+        cells[i] = value
+    }
+}
+
+// copy src's cells into dst; false unless the shapes match
+function bool matrix_copy_from(Matrix dst, Matrix src) {
+    if !matrix_same_shape(dst, src) {
+        return false
+    }
+    mem.copy_cells(dst.data, src.data, dst.rows * dst.cols)
+    return true
+}
+
+// a freshly allocated transpose
+function Matrix matrix_transpose(Matrix src) {
+    var out = 0 as Matrix
+    if src != 0 {
+        out = matrix_new(src.cols, src.rows)
+        if out != 0 {
+            for r in range(0, src.rows) {
+                for c in range(0, src.cols) {
+                    matrix_set(out, c, r, matrix_get(src, r, c))
+                }
+            }
+        }
+    }
+    return out
+}
+
+// element-wise combine; null on a shape mismatch
+function Matrix matrix_add(Matrix a, Matrix b) {
+    var out = 0 as Matrix
+    if matrix_same_shape(a, b) {
+        out = matrix_new(a.rows, a.cols)
+        if out != 0 {
+            let ac = a.data as *long
+            let bc = b.data as *long
+            let oc = out.data as *long
+            let total = a.rows * a.cols
+            for i in range(0, total) {
+                oc[i] = ac[i] + bc[i]
+            }
+        }
+    }
+    return out
+}
+
+function Matrix matrix_sub(Matrix a, Matrix b) {
+    var out = 0 as Matrix
+    if matrix_same_shape(a, b) {
+        out = matrix_new(a.rows, a.cols)
+        if out != 0 {
+            let ac = a.data as *long
+            let bc = b.data as *long
+            let oc = out.data as *long
+            let total = a.rows * a.cols
+            for i in range(0, total) {
+                oc[i] = ac[i] - bc[i]
+            }
+        }
+    }
+    return out
+}
+
+function Matrix matrix_scale(Matrix a, long factor) {
+    var out = 0 as Matrix
+    if a != 0 {
+        out = matrix_new(a.rows, a.cols)
+        if out != 0 {
+            let ac = a.data as *long
+            let oc = out.data as *long
+            let total = a.rows * a.cols
+            for i in range(0, total) {
+                oc[i] = ac[i] * factor
+            }
+        }
+    }
+    return out
+}
+
+// matrix product; requires a.cols == b.rows, null otherwise
+function Matrix matrix_mul(Matrix a, Matrix b) {
+    var out = 0 as Matrix
+    if a != 0 && b != 0 && a.cols == b.rows {
+        out = matrix_new(a.rows, b.cols)
+        if out != 0 {
+            for r in range(0, a.rows) {
+                for c in range(0, b.cols) {
+                    var sum = 0
+                    for k in range(0, a.cols) {
+                        sum += matrix_get(a, r, k) * matrix_get(b, k, c)
+                    }
+                    matrix_set(out, r, c, sum)
+                }
+            }
+        }
+    }
+    return out
+}
+
+// dst += src in place; false unless the shapes match
+function bool matrix_add_into(Matrix dst, Matrix src) {
+    if !matrix_same_shape(dst, src) {
+        return false
+    }
+    let dc = dst.data as *long
+    let sc = src.data as *long
+    let total = dst.rows * dst.cols
+    for i in range(0, total) {
+        dc[i] = dc[i] + sc[i]
+    }
+    return true
+}
+
+// sum of the diagonal of a square matrix; 0 otherwise
+function long matrix_trace(Matrix m) {
+    var total = 0
+    if matrix_is_square(m) {
+        for i in range(0, m.rows) {
+            total += matrix_get(m, i, i)
+        }
+    }
+    return total
+}
+
+function long matrix_sum(Matrix m) {
+    var total = 0
+    if m != 0 && m.data != 0 {
+        let cells = m.data as *long
+        let count = m.rows * m.cols
+        for i in range(0, count) {
+            total += cells[i]
+        }
+    }
+    return total
+}
+
+function long matrix_max(Matrix m) {
+    var best = 0
+    if m != 0 && m.data != 0 {
+        let cells = m.data as *long
+        let count = m.rows * m.cols
+        if count > 0 {
+            best = cells[0]
+            for i in range(1, count) {
+                if cells[i] > best {
+                    best = cells[i]
+                }
+            }
+        }
+    }
+    return best
+}
+
+function long matrix_min(Matrix m) {
+    var best = 0
+    if m != 0 && m.data != 0 {
+        let cells = m.data as *long
+        let count = m.rows * m.cols
+        if count > 0 {
+            best = cells[0]
+            for i in range(1, count) {
+                if cells[i] < best {
+                    best = cells[i]
+                }
+            }
+        }
+    }
+    return best
+}
+
+// same shape and every cell equal
+function bool matrix_equals(Matrix a, Matrix b) {
+    if !matrix_same_shape(a, b) {
+        return false
+    }
+    let ac = a.data as *)SBMATRIX"
+            R"SBMATRIX(long
+    let bc = b.data as *long
+    let count = a.rows * a.cols
+    for i in range(0, count) {
+        if ac[i] != bc[i] {
+            return false
+        }
+    }
+    return true
+}
+)SBMATRIX"},
         {"mem", R"SBMEM(// Memory operations and typed read/write helpers over compiler builtins.
 
 function ptr make(int size) {
@@ -3974,6 +6582,270 @@ function void res_void_free(ResVoid result) {
     }
 }
 )SBRESULT"},
+        {"strbuf", R"SBSTRBUF(import mem
+
+// Growable string builder.
+//
+// Appending N pieces to a strbuf costs O(total) instead of the O(N * total) that
+// repeated string_append would cost, because the buffer grows geometrically and
+// the final string is materialized only once.
+//
+// Ownership:
+// - strbuf_new / strbuf_with_capacity allocate; the caller owns the handle and
+//   must release it with strbuf_free.
+// - strbuf_to_string returns a NEW heap string; freeing the builder does not free
+//   it, and freeing the string does not touch the builder.
+//
+// Layout: the handle is a view over a 24-byte header.
+//   [0]  data : ptr -> heap block of `cap` bytes
+//   [8]  len  : int -> bytes written so far
+//   [16] cap  : int -> allocated bytes
+
+view StrBuf {
+    data: ptr @ 0
+    len: int @ 8
+    cap: int @ 16
+}
+
+// initial capacity for a builder created without an explicit size
+let STRBUF_MIN_CAPACITY: int = 32
+
+function StrBuf strbuf_alloc_handle() {
+    var handle = malloc(24) as StrBuf
+    if handle != 0 {
+        handle.data = 0
+        handle.len = 0
+        handle.cap = 0
+    }
+    return handle
+}
+
+function StrBuf strbuf_with_capacity(int capacity) {
+    var want = capacity
+    if want < STRBUF_MIN_CAPACITY {
+        want = STRBUF_MIN_CAPACITY
+    }
+    let block = mem.make_zero(want)
+    if block == 0 {
+        return 0 as StrBuf
+    }
+    let handle = strbuf_alloc_handle()
+    if handle == 0 {
+        free(block)
+        return 0 as StrBuf
+    }
+    handle.data = block
+    handle.len = 0
+    handle.cap = want
+    return handle
+}
+
+function StrBuf strbuf_new() {
+    return strbuf_with_capacity(STRBUF_MIN_CAPACITY)
+}
+
+function void strbuf_free(StrBuf buf) {
+    if buf == 0 {
+        return
+    }
+    if buf.data != 0 {
+        free(buf.data)
+        buf.data = 0
+    }
+    free(buf)
+}
+
+function int strbuf_len(StrBuf buf) {
+    if buf == 0 {
+        return 0
+    }
+    return buf.len
+}
+
+function int strbuf_capacity(StrBuf buf) {
+    if buf == 0 {
+        return 0
+    }
+    return buf.cap
+}
+
+function bool strbuf_is_empty(StrBuf buf) {
+    return strbuf_len(buf) == 0
+}
+
+function void strbuf_clear(StrBuf buf) {
+    if buf == 0 {
+        return
+    }
+    buf.len = 0
+    if buf.data != 0 && buf.cap > 0 {
+        mem.write8(buf.data, 0)
+    }
+}
+
+// grow the backing block so it can hold at least `needed` bytes. returns false on
+// allocation failure (the builder keeps its previous contents).
+function bool strbuf_reserve(StrBuf buf, int needed) {
+    if buf == 0 {
+        return false
+    }
+    if needed <= buf.cap {
+        return true
+    }
+    var want = buf.cap
+    if want < STRBUF_MIN_CAPACITY {
+        want = STRBUF_MIN_CAPACITY
+    }
+    while want < needed {
+        let previous = want
+        want = want + (want >> 1)
+        if want <= previous {
+            want = previous + 1
+        }
+    }
+    let block = mem.make_zero(want)
+    if block == 0 {
+        return false
+    }
+    if buf.data != 0 && buf.len > 0 {
+        memcpy(block, buf.data, buf.len)
+        free(buf.data)
+    }
+    buf.data = block
+    buf.cap = want
+    return true
+}
+
+// append one byte. returns false only on allocation failure.
+function bool strbuf_push_byte(StrBuf buf, int byte_value) {
+    if buf == 0 {
+        return false
+    }
+    if !strbuf_reserve(buf, buf.len + 1) {
+        return false
+    }
+    mem.write8(buf.data + buf.len, byte_value & 0xFF)
+    buf.len = buf.len + 1
+    return true
+}
+
+// append a string's bytes (no null terminator is written). a null string is a
+// no-op, so it is safe to append an optional value.
+function bool strbuf_append(StrBuf buf, str text_value) {
+    if buf == 0 {
+        return false
+    }
+    if text_value == 0 {
+        return true
+    }
+    let n = string_length(text_value)
+    if n <= 0 {
+        return true
+    }
+    if !strbuf_reserve(buf, buf.len + n) {
+        return false
+    }
+    memcpy(buf.data + buf.len, text_value as ptr, n)
+    buf.len = buf.len + n
+    return true
+}
+
+// append a bounded slice of a string: bytes [start, start+count).
+function bool strbuf_append_slice(StrBuf buf, str text_value, int start, int count) {
+    if buf == 0 {
+        return false
+    }
+    if text_value == 0 || count <= 0 {
+        return true
+    }
+    var offset = start
+    var n = count
+    let total = string_length(text_value)
+    if offset < 0 {
+        n = n + offset
+        offset = 0
+    }
+    if offset >= total || n <= 0 {
+        return true
+    }
+    if offset + n > total {
+        n = total - offset
+    }
+    if !strbuf_reserve(buf, buf.len + n) {
+        return false
+    }
+    memcpy(buf.data + buf.len, (text_value as ptr) + offset, n)
+    buf.len = buf.len + n
+    return true
+}
+
+// append a signed integer in base 10.
+function bool strbuf_append_int(StrBuf buf, i64 value) {
+    if buf == 0 {
+        return false
+    }
+    return strbuf_append(buf, int_to_string(value))
+}
+
+// append `count` copies of a single byte.
+function bool strbuf_append_repeat(StrBuf buf, int byte_value, int count) {
+    if buf == 0 {
+        return false
+    }
+    if count <= 0 {
+        return true
+    }
+    if !strbuf_reserve(buf, buf.len + count) {
+        return false
+    }
+    memset(buf.data + buf.len, byte_value & 0xFF, count)
+    buf.len = buf.len + count
+    return true
+}
+
+// current contents as a str view into the builder's own storage. valid until the
+// next append that grows the block or the next strbuf_free. this may reserve one
+// extra byte for the terminator, so do not hold a view across an append.
+function str strbuf_view(StrBuf buf) {
+    if buf == 0 || buf.data == 0 {
+        return "" as str
+    }
+    return strbuf_terminate_view(buf)
+}
+
+// ensure a null terminator after the used bytes, then return the data pointer as a
+// str. the terminator lives in the capacity (reserve guarantees room for one extra
+// byte beyond what has been appended).
+function str strbuf_terminate_view(StrBuf buf) {
+    if buf == 0 || buf.data == 0 {
+        return "" as str
+    }
+    if !strbuf_reserve(buf, buf.len + 1) {
+        return "" as str
+    }
+    mem.write8(buf.data + buf.len, 0)
+    return buf.data as str
+}
+
+// materialize the contents as a fresh heap string. empty builders yield an empty
+// string, never a null.
+function str strbuf_to_string(StrBuf buf) {
+    if buf == 0 || buf.data == 0 || buf.len <= 0 {
+        return make_string("")
+    }
+    return string_substring(strbuf_view(buf), 0, buf.len)
+}
+
+// materialize the contents as a fresh heap string and reset the builder to empty.
+function str strbuf_take_string(StrBuf buf) {
+    if buf == 0 || buf.data == 0 || buf.len <= 0 {
+        return make_string("")
+    }
+    let result = string_substring(strbuf_view(buf), 0, buf.len)
+    strbuf_clear(buf)
+    return result
+}
+)SBSTRBUF"},
         {"text", R"SBTEXT(import mem
 import ascii
 

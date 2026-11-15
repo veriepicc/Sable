@@ -34,6 +34,14 @@ Output:
   --fast        skip project discovery for single-file compiles
   --no-vectorize disable loop auto-vectorization
 
+Warnings (off by default):
+  -Wall                  enable every warning
+  -W<name>               enable one warning (see -Wlist)
+  -Wno-<name>            disable one warning
+  -Wnone                 disable every warning
+  -Werror                treat enabled warnings as errors
+  -Wlist                 list every warning kind
+
 Project:
   build         find sable.project and build it
   build <path>  build a specific sable.project
@@ -467,7 +475,7 @@ static void print_timing_block(std::string_view title, const std::vector<sable::
     return 0;
 }
 
-[[nodiscard]] int run_file(const std::string& filename, bool run_immediately, sable::OutputKind output_kind, bool quiet, bool timings, bool fast_mode, const std::filesystem::path& compiler_exe, bool vectorize_cli = true) {
+[[nodiscard]] int run_file(const std::string& filename, bool run_immediately, sable::OutputKind output_kind, bool quiet, bool timings, bool fast_mode, const std::filesystem::path& compiler_exe, bool vectorize_cli = true, sable::warnings::WarningPolicy warning_policy = {}) {
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto elapsed_ms = [](auto start, auto end) {
         return std::chrono::duration<double, std::milli>(end - start).count();
@@ -533,6 +541,7 @@ static void print_timing_block(std::string_view title, const std::vector<sable::
             .collect_timings = timings,
             .collect_function_offsets = !quiet,
             .vectorize = project_vectorize,
+            .warning_policy = warning_policy,
         });
         if (timings) {
             add_stage_timing("driver.compile_and_run", elapsed_ms(compile_run_start, now()));
@@ -559,13 +568,14 @@ static void print_timing_block(std::string_view title, const std::vector<sable::
             .collect_timings = timings,
             .collect_function_offsets = !quiet,
             .vectorize = project_vectorize,
+            .warning_policy = warning_policy,
         });
         if (timings) {
             add_stage_timing("driver.compile_call", elapsed_ms(compile_start, now()));
         }
         if (result.success) {
             for (const auto& warning : result.warnings) {
-                std::println("\033[1;93mwarning:\033[0m {}", warning);
+                std::print(std::cerr, "\033[1;93mwarning:\033[0m {}\n", warning);
             }
             std::string outname = filename;
             if (outname.ends_with(".sb") || outname.ends_with(".op")) {
@@ -729,7 +739,7 @@ static void print_timing_block(std::string_view title, const std::vector<sable::
     }
 }
 
-[[nodiscard]] int build_project(std::optional<std::string> project_path_arg, bool timings, const std::filesystem::path& compiler_exe) {
+[[nodiscard]] int build_project(std::optional<std::string> project_path_arg, bool timings, const std::filesystem::path& compiler_exe, sable::warnings::WarningPolicy warning_policy = {}) {
     auto now = [] { return std::chrono::steady_clock::now(); };
     auto elapsed_ms = [](auto start, auto end) {
         return std::chrono::duration<double, std::milli>(end - start).count();
@@ -812,6 +822,7 @@ static void print_timing_block(std::string_view title, const std::vector<sable::
         .debug_info = config.debug,
         .collect_timings = timings,
         .vectorize = config.vectorize,
+        .warning_policy = warning_policy,
     });
     if (timings) {
         add_stage_timing("driver.compile_call", elapsed_ms(compile_start, now()));
@@ -819,7 +830,7 @@ static void print_timing_block(std::string_view title, const std::vector<sable::
     
     if (result.success) {
         for (const auto& warning : result.warnings) {
-            std::println("\033[1;93mwarning:\033[0m {}", warning);
+            std::print(std::cerr, "\033[1;93mwarning:\033[0m {}\n", warning);
         }
         std::string outname = config.output;
         if (outname.empty()) {
@@ -997,7 +1008,12 @@ export int main(int argc, char* argv[]) {
         bool vectorize = true;
         auto output_kind = sable::OutputKind::Exe;
         std::string filename;
-        
+
+        sable::warnings::WarningPolicy warning_policy;
+        bool warnings_enabled = false;
+        bool treat_warnings_as_errors = false;
+        bool pending_all_warnings = false;   // -Wall seen, apply after loop
+
         for (int i = 1; i < argc; ++i) {
             std::string arg = argv[i];
             if (arg == "--run" || arg == "-r") {
@@ -1012,17 +1028,67 @@ export int main(int argc, char* argv[]) {
                 output_kind = sable::OutputKind::Dll;
             } else if (arg == "--no-vectorize" || arg == "--no-simd") {
                 vectorize = false;
+            } else if (arg == "-Werror") {
+                treat_warnings_as_errors = true;
+            } else if (arg == "-Wall") {
+                warnings_enabled = true;
+                pending_all_warnings = true;
+            } else if (arg == "-Wnone" || arg == "-Wno-all") {
+                warning_policy.disable_all();
+                warnings_enabled = false;
+                pending_all_warnings = false;
+            } else if (arg == "-Whelp" || arg == "-Wlist") {
+                std::println("warning kinds (use -W<name> / -Wno-<name>):");
+                for (std::uint8_t k = 0; k < static_cast<std::uint8_t>(sable::warnings::WarningKind::Count); ++k) {
+                    auto kind = static_cast<sable::warnings::WarningKind>(k);
+                    std::println("  -W{:<24} {}", sable::warnings::warning_name(kind),
+                                 sable::warnings::warning_description(kind));
+                }
+                std::println("  -Wall                    enable every warning");
+                std::println("  -Wnone                   disable every warning");
+                std::println("  -Werror                  treat enabled warnings as errors");
+                return 0;
+            } else if (arg.starts_with("-Wno-")) {
+                auto name = std::string_view(arg).substr(5);
+                if (name == "all") {
+                    warning_policy.disable_all();
+                    warnings_enabled = false;
+                    pending_all_warnings = false;
+                } else if (auto kind = sable::warnings::parse_warning_name(name)) {
+                    warning_policy.set(*kind, sable::warnings::WarningLevel::Allow);
+                } else {
+                    std::print(std::cerr, "\033[1;91merror\033[0m: unknown warning '{}' (try -Wlist)\n", name);
+                    return 1;
+                }
+            } else if (arg.starts_with("-W")) {
+                auto name = std::string_view(arg).substr(2);
+                if (auto kind = sable::warnings::parse_warning_name(name)) {
+                    warning_policy.set(*kind, sable::warnings::WarningLevel::Warn);
+                    warnings_enabled = true;
+                } else {
+                    std::print(std::cerr, "\033[1;91merror\033[0m: unknown warning '{}' (try -Wlist)\n", name);
+                    return 1;
+                }
             } else if (!arg.starts_with("-")) {
                 filename = arg;
             }
         }
+
+        // -Wall first, then any explicit -Wno-<name> applied in the loop survives
+        if (pending_all_warnings) {
+            warning_policy.enable_all();
+        }
+        if (treat_warnings_as_errors) {
+            warning_policy.set_all_level(sable::warnings::WarningLevel::Error);
+        }
+        (void)warnings_enabled;
 
         if (filename.empty()) {
             std::println(std::cerr, "Error: no input file specified");
             return 1;
         }
 
-        return run_file(filename, run, output_kind, quiet, timings, fast_mode, compiler_exe, vectorize);
+        return run_file(filename, run, output_kind, quiet, timings, fast_mode, compiler_exe, vectorize, warning_policy);
     } catch (const std::exception& ex) {
         std::print(std::cerr, "\033[1;91minternal error\033[0m: uncaught exception: {}\n", ex.what());
         return 1;

@@ -1,0 +1,336 @@
+import mem
+
+// Dynamic bitset: a growable array of bits backed by a heap block of 64-bit
+// words.
+//
+// Ownership:
+// - bitset_new / bitset_with_capacity / bitset_clone allocate; the caller owns
+//   the returned handle and must release it with bitset_free.
+// - every other function borrows the handle and allocates nothing.
+//
+// Layout: the handle is a view over a 24-byte header.
+//   [0]  words   : ptr  -> heap block of 8-byte words, words[0] is bit 0..63
+//   [8]  word_count : int  -> number of allocated words
+//   [16] bit_count  : int  -> number of valid bits (<= word_count*64)
+//
+// All bits above bit_count read as 0 and are cleared on resize, so a bits bit is
+// always a valid bit.
+
+view BitSet {
+    words: ptr @ 0
+    word_count: int @ 8
+    bit_count: int @ 16
+}
+
+// one word is 64 bits
+let BITSET_WORD_BITS: int = 64
+
+function int bitset_words_for(int bit_count) {
+    if bit_count <= 0 {
+        return 0
+    }
+    return (bit_count + BITSET_WORD_BITS - 1) / BITSET_WORD_BITS
+}
+
+function BitSet bitset_alloc_handle() {
+    var handle = malloc(24) as BitSet
+    if handle != 0 {
+        handle.words = 0
+        handle.word_count = 0
+        handle.bit_count = 0
+    }
+    return handle
+}
+
+function BitSet bitset_new() {
+    return bitset_with_capacity(64)
+}
+
+function BitSet bitset_with_capacity(int bit_count) {
+    if bit_count <= 0 {
+        return bitset_alloc_handle()
+    }
+    let needed = bitset_words_for(bit_count)
+    var block = mem.make_zero(needed * 8)
+    if block == 0 {
+        return 0 as BitSet
+    }
+    let handle = bitset_alloc_handle()
+    if handle == 0 {
+        free(block)
+        return 0 as BitSet
+    }
+    handle.words = block
+    handle.word_count = needed
+    // logical size is the requested count; the allocated words round up, but the
+    // tail bits are already zero so they read false
+    handle.bit_count = bit_count
+    return handle
+}
+
+function BitSet bitset_clone(BitSet source) {
+    if source == 0 {
+        return 0 as BitSet
+    }
+    let words = source.word_count
+    var block = 0 as ptr
+    if words > 0 {
+        block = mem.make_copy(source.words, words * 8)
+        if block == 0 {
+            return 0 as BitSet
+        }
+    }
+    let handle = bitset_alloc_handle()
+    if handle == 0 {
+        free(block)
+        return 0 as BitSet
+    }
+    handle.words = block
+    handle.word_count = words
+    handle.bit_count = source.bit_count
+    return handle
+}
+
+function void bitset_free(BitSet bits) {
+    if bits == 0 {
+        return
+    }
+    if bits.words != 0 {
+        free(bits.words)
+        bits.words = 0
+    }
+    free(bits)
+}
+
+function int bitset_len(BitSet bits) {
+    if bits == 0 {
+        return 0
+    }
+    return bits.bit_count
+}
+
+function bool bitset_is_empty(BitSet bits) {
+    if bits == 0 || bits.bit_count <= 0 {
+        return true
+    }
+    let words = bits.words as *i64
+    var i = 0
+    while i < bits.word_count {
+        if words[i] != 0 {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+// grow so that `bit_count` bits are representable. existing bits are preserved;
+// new bits are zero. returns false on allocation failure (the bits is untouched).
+function bool bitset_reserve(BitSet bits, int bit_count) {
+    if bits == 0 {
+        return false
+    }
+    if bit_count <= bits.bit_count {
+        return true
+    }
+    let old_words = bits.word_count
+    let new_words = bitset_words_for(bit_count)
+    if new_words <= old_words {
+        bits.bit_count = bit_count
+        return true
+    }
+    let block = mem.make_zero(new_words * 8)
+    if block == 0 {
+        return false
+    }
+    if old_words > 0 && bits.words != 0 {
+        mem.copy_cells(block, bits.words, old_words)
+        free(bits.words)
+    }
+    bits.words = block
+    bits.word_count = new_words
+    bits.bit_count = bit_count
+    return true
+}
+
+// read a bit. any index outside [0, bit_count) reads false.
+function bool bitset_get(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return false
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    let word = words[word_index]
+    return ((word >> bit_index) & 1) != 0
+}
+
+function i64 bitset_word_mask(int bit_index) {
+    return 1 << bit_index
+}
+
+// bits a bit to 1, growing if needed. returns false on allocation failure.
+function bool bitset_set(BitSet bits, int index) {
+    if bits == 0 || index < 0 {
+        return false
+    }
+    if index >= bits.bit_count {
+        if !bitset_reserve(bits, index + 1) {
+            return false
+        }
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] | bitset_word_mask(bit_index)
+    return true
+}
+
+// bits a bit to 0. does not grow; a bit outside the range is already 0.
+function void bitset_clear(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] & (bitset_word_mask(bit_index) ^ (0 - 1))
+}
+
+function void bitset_toggle(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] ^ bitset_word_mask(bit_index)
+}
+
+function void bitset_set_all(BitSet bits) {
+    if bits == 0 || bits.word_count <= 0 {
+        return
+    }
+    let words = bits.words as *i64
+    var i = 0
+    while i < bits.word_count {
+        words[i] = 0 - 1
+        i++
+    }
+    bitset_trim_tail(bits)
+}
+
+function void bitset_clear_all(BitSet bits) {
+    if bits == 0 || bits.words == 0 {
+        return
+    }
+    memset(bits.words, 0, bits.word_count * 8)
+}
+
+// the top word can hold bits beyond bit_count; mask them off after set_all.
+function void bitset_trim_tail(BitSet bits) {
+    if bits == 0 || bits.word_count <= 0 || bits.bit_count <= 0 {
+        return
+    }
+    let used_in_last = bits.bit_count % BITSET_WORD_BITS
+    if used_in_last == 0 {
+        return
+    }
+    let words = bits.words as *i64
+    let last = bits.word_count - 1
+    let keep = (1 << used_in_last) - 1
+    words[last] = words[last] & keep
+}
+
+// number of bits bits. cheap to compute, this is a straightforward popcount.
+function int bitset_count(BitSet bits) {
+    if bits == 0 || bits.words == 0 {
+        return 0
+    }
+    let words = bits.words as *i64
+    var total = 0
+    var i = 0
+    while i < bits.word_count {
+        var word = words[i]
+        while word != 0 {
+            word = word & (word - 1)
+            total++
+        }
+        i++
+    }
+    return total
+}
+
+// index of the first bits bit at or after `start`, or -1 if none.
+function int bitset_find_next(BitSet bits, int start) {
+    if bits == 0 || bits.bit_count <= 0 {
+        return -1
+    }
+    var index = start
+    if index < 0 {
+        index = 0
+    }
+    while index < bits.bit_count {
+        if bitset_get(bits, index) {
+            return index
+        }
+        index++
+    }
+    return -1
+}
+
+// bitset_set(a, index) for every bits bit in b. grows a as needed.
+function void bitset_or_into(BitSet target, BitSet source) {
+    if target == 0 || source == 0 {
+        return
+    }
+    var index = bitset_find_next(source, 0)
+    while index >= 0 {
+        bitset_set(target, index)
+        index = bitset_find_next(source, index + 1)
+    }
+}
+
+function int bitset_and_count(BitSet a, BitSet b) {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    let words_a = a.words as *i64
+    let words_b = b.words as *i64
+    var shared = a.word_count
+    if b.word_count < shared {
+        shared = b.word_count
+    }
+    var total = 0
+    var i = 0
+    while i < shared {
+        var word = words_a[i] & words_b[i]
+        while word != 0 {
+            word = word & (word - 1)
+            total++
+        }
+        i++
+    }
+    return total
+}
+
+// true when a and b share at least one bits bit.
+function bool bitset_intersects(BitSet a, BitSet b) {
+    if a == 0 || b == 0 {
+        return false
+    }
+    let words_a = a.words as *i64
+    let words_b = b.words as *i64
+    var shared = a.word_count
+    if b.word_count < shared {
+        shared = b.word_count
+    }
+    var i = 0
+    while i < shared {
+        if (words_a[i] & words_b[i]) != 0 {
+            return true
+        }
+        i++
+    }
+    return false
+}

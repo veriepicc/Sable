@@ -1,0 +1,9 @@
+// a negative shift count is a sign-extension bug (masked to low 6 bits)
+function int use(int v) {
+    return v
+}
+
+function int main() {
+    let a = 1 << -1
+    return use(a)
+}

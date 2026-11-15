@@ -1,0 +1,332 @@
+import mem
+
+// Dense matrix of 64-bit signed integers, stored row-major in one contiguous block.
+//
+// A binder block is malloc'd, so the layout is a view over the header rather than a
+// struct (struct fields would be inline, not an overlay):
+//   [0]  data  -> heap block of rows*cols cells, row-major
+//   [8]  rows
+//   [16] cols
+//   [24] flags (reserved)
+//
+// Ownership: matrix_new / matrix_zeros / matrix_identity / matrix_clone allocate; the caller
+// owns the handle and releases it with matrix_free. Every other function borrows.
+//
+// Element access is bounds-checked; an out-of-range read yields 0 and a write is
+// ignored, so a bad index can never fault.
+
+view Matrix {
+    data: ptr @ 0
+    rows: int @ 8
+    cols: int @ 16
+    flags: int @ 24
+}
+
+function Matrix matrix_alloc_handle() {
+    var handle = malloc(32) as Matrix
+    if handle != 0 {
+        handle.data = 0
+        handle.rows = 0
+        handle.cols = 0
+        handle.flags = 0
+    }
+    return handle
+}
+
+// rows and cols below 1 give a null handle, never a malformed matrix
+function Matrix matrix_new(int rows, int cols) {
+    var handle = 0 as Matrix
+    if rows > 0 && cols > 0 {
+        let block = mem.make_zero(rows * cols * 8)
+        if block != 0 {
+            let made = matrix_alloc_handle()
+            if made != 0 {
+                made.data = block
+                made.rows = rows
+                made.cols = cols
+            } else {
+                free(block)
+            }
+            handle = made
+        }
+    }
+    return handle
+}
+
+function Matrix matrix_zeros(int rows, int cols) => matrix_new(rows, cols)
+
+function Matrix matrix_identity(int n) {
+    let m = matrix_new(n, n)
+    if m != 0 {
+        for i in range(0, n) {
+            matrix_set(m, i, i, 1)
+        }
+    }
+    return m
+}
+
+function Matrix matrix_clone(Matrix src) {
+    var handle = 0 as Matrix
+    if src != 0 {
+        let block = mem.make_copy(src.data, src.rows * src.cols * 8)
+        if block != 0 {
+            let made = matrix_alloc_handle()
+            if made != 0 {
+                made.data = block
+                made.rows = src.rows
+                made.cols = src.cols
+            } else {
+                free(block)
+            }
+            handle = made
+        }
+    }
+    return handle
+}
+
+function void matrix_free(Matrix m) {
+    if m == 0 {
+        return
+    }
+    if m.data != 0 {
+        free(m.data)
+        m.data = 0
+    }
+    free(m)
+}
+
+function int matrix_rows(Matrix m) {
+    if m == 0 {
+        return 0
+    }
+    return m.rows
+}
+
+function int matrix_cols(Matrix m) {
+    if m == 0 {
+        return 0
+    }
+    return m.cols
+}
+
+function bool matrix_is_empty(Matrix m) => matrix_rows(m) <= 0 || matrix_cols(m) <= 0
+
+function bool matrix_is_square(Matrix m) => m != 0 && m.rows > 0 && m.rows == m.cols
+
+function bool matrix_same_shape(Matrix a, Matrix b) =>
+    a != 0 && b != 0 && a.rows == b.rows && a.cols == b.cols
+
+function bool matrix_in_bounds(Matrix m, int r, int c) =>
+    m != 0 && r >= 0 && r < m.rows && c >= 0 && c < m.cols
+
+// element read; an out-of-range cell reads 0
+function long matrix_get(Matrix m, int r, int c) {
+    if !matrix_in_bounds(m, r, c) {
+        return 0
+    }
+    let cells = m.data as *long
+    return cells[r * m.cols + c]
+}
+
+// element write; an out-of-range cell is ignored
+function void matrix_set(Matrix m, int r, int c, long value) {
+    if !matrix_in_bounds(m, r, c) {
+        return
+    }
+    let cells = m.data as *long
+    cells[r * m.cols + c] = value
+}
+
+function void matrix_fill(Matrix m, long value) {
+    if m == 0 || m.data == 0 {
+        return
+    }
+    let cells = m.data as *long
+    let total = m.rows * m.cols
+    for i in range(0, total) {
+        cells[i] = value
+    }
+}
+
+// copy src's cells into dst; false unless the shapes match
+function bool matrix_copy_from(Matrix dst, Matrix src) {
+    if !matrix_same_shape(dst, src) {
+        return false
+    }
+    mem.copy_cells(dst.data, src.data, dst.rows * dst.cols)
+    return true
+}
+
+// a freshly allocated transpose
+function Matrix matrix_transpose(Matrix src) {
+    var out = 0 as Matrix
+    if src != 0 {
+        out = matrix_new(src.cols, src.rows)
+        if out != 0 {
+            for r in range(0, src.rows) {
+                for c in range(0, src.cols) {
+                    matrix_set(out, c, r, matrix_get(src, r, c))
+                }
+            }
+        }
+    }
+    return out
+}
+
+// element-wise combine; null on a shape mismatch
+function Matrix matrix_add(Matrix a, Matrix b) {
+    var out = 0 as Matrix
+    if matrix_same_shape(a, b) {
+        out = matrix_new(a.rows, a.cols)
+        if out != 0 {
+            let ac = a.data as *long
+            let bc = b.data as *long
+            let oc = out.data as *long
+            let total = a.rows * a.cols
+            for i in range(0, total) {
+                oc[i] = ac[i] + bc[i]
+            }
+        }
+    }
+    return out
+}
+
+function Matrix matrix_sub(Matrix a, Matrix b) {
+    var out = 0 as Matrix
+    if matrix_same_shape(a, b) {
+        out = matrix_new(a.rows, a.cols)
+        if out != 0 {
+            let ac = a.data as *long
+            let bc = b.data as *long
+            let oc = out.data as *long
+            let total = a.rows * a.cols
+            for i in range(0, total) {
+                oc[i] = ac[i] - bc[i]
+            }
+        }
+    }
+    return out
+}
+
+function Matrix matrix_scale(Matrix a, long factor) {
+    var out = 0 as Matrix
+    if a != 0 {
+        out = matrix_new(a.rows, a.cols)
+        if out != 0 {
+            let ac = a.data as *long
+            let oc = out.data as *long
+            let total = a.rows * a.cols
+            for i in range(0, total) {
+                oc[i] = ac[i] * factor
+            }
+        }
+    }
+    return out
+}
+
+// matrix product; requires a.cols == b.rows, null otherwise
+function Matrix matrix_mul(Matrix a, Matrix b) {
+    var out = 0 as Matrix
+    if a != 0 && b != 0 && a.cols == b.rows {
+        out = matrix_new(a.rows, b.cols)
+        if out != 0 {
+            for r in range(0, a.rows) {
+                for c in range(0, b.cols) {
+                    var sum = 0
+                    for k in range(0, a.cols) {
+                        sum += matrix_get(a, r, k) * matrix_get(b, k, c)
+                    }
+                    matrix_set(out, r, c, sum)
+                }
+            }
+        }
+    }
+    return out
+}
+
+// dst += src in place; false unless the shapes match
+function bool matrix_add_into(Matrix dst, Matrix src) {
+    if !matrix_same_shape(dst, src) {
+        return false
+    }
+    let dc = dst.data as *long
+    let sc = src.data as *long
+    let total = dst.rows * dst.cols
+    for i in range(0, total) {
+        dc[i] = dc[i] + sc[i]
+    }
+    return true
+}
+
+// sum of the diagonal of a square matrix; 0 otherwise
+function long matrix_trace(Matrix m) {
+    var total = 0
+    if matrix_is_square(m) {
+        for i in range(0, m.rows) {
+            total += matrix_get(m, i, i)
+        }
+    }
+    return total
+}
+
+function long matrix_sum(Matrix m) {
+    var total = 0
+    if m != 0 && m.data != 0 {
+        let cells = m.data as *long
+        let count = m.rows * m.cols
+        for i in range(0, count) {
+            total += cells[i]
+        }
+    }
+    return total
+}
+
+function long matrix_max(Matrix m) {
+    var best = 0
+    if m != 0 && m.data != 0 {
+        let cells = m.data as *long
+        let count = m.rows * m.cols
+        if count > 0 {
+            best = cells[0]
+            for i in range(1, count) {
+                if cells[i] > best {
+                    best = cells[i]
+                }
+            }
+        }
+    }
+    return best
+}
+
+function long matrix_min(Matrix m) {
+    var best = 0
+    if m != 0 && m.data != 0 {
+        let cells = m.data as *long
+        let count = m.rows * m.cols
+        if count > 0 {
+            best = cells[0]
+            for i in range(1, count) {
+                if cells[i] < best {
+                    best = cells[i]
+                }
+            }
+        }
+    }
+    return best
+}
+
+// same shape and every cell equal
+function bool matrix_equals(Matrix a, Matrix b) {
+    if !matrix_same_shape(a, b) {
+        return false
+    }
+    let ac = a.data as *long
+    let bc = b.data as *long
+    let count = a.rows * a.cols
+    for i in range(0, count) {
+        if ac[i] != bc[i] {
+            return false
+        }
+    }
+    return true
+}

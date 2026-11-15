@@ -1,0 +1,11 @@
+// a bare return in a function that must produce a value leaves the caller reading garbage
+function int f(int a) {
+    if a > 0 {
+        return
+    }
+    return 1
+}
+
+function int main() {
+    return f(1)
+}

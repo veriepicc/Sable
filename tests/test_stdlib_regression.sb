@@ -221,6 +221,72 @@ function int test_json_http() {
 
     let bad = http_parse_url("http://bad:99999/test")
     if bad != 0 { http_url_free(bad); return 62 }
+
+    // url encoding round-trip
+    let enc = http_url_encode("a b&c=d/e~f-g_h.i")
+    if !text_eq(enc, "a%20b%26c%3Dd%2Fe~f-g_h.i") { free(enc); return 63 }
+    free(enc)
+    let dec = http_url_decode("a%20b%26c%3Dd%2Fe")
+    if !text_eq(dec, "a b&c=d/e") { free(dec); return 64 }
+    free(dec)
+    let dec_plus = http_url_decode("key+value")
+    if !text_eq(dec_plus, "key value") { free(dec_plus); return 65 }
+    free(dec_plus)
+
+    // request builder: header accumulation, body, options
+    var req = http_request_new("POST", "https://api.example.com/v1/items")
+    if req == 0 { return 66 }
+    if !text_eq(req.method, "POST") or !text_eq(req.url, "https://api.example.com/v1/items") {
+        http_request_free(req); return 67
+    }
+    http_request_header(req, "X-One", "first")
+    http_request_header(req, "X-Two", "second")
+    let hdr_block = req.header_buf as str
+    if !text_contains(hdr_block, "X-One: first\r\n") { http_request_free(req); return 68 }
+    if !text_contains(hdr_block, "X-Two: second\r\n") { http_request_free(req); return 69 }
+    http_request_body_text(req, "payload", "application/json")
+    if req.body_len != 7 { http_request_free(req); return 70 }
+    if !text_eq(req.content_type, "application/json") { http_request_free(req); return 71 }
+    http_request_user_agent(req, "Sable/1.0")
+    if !text_eq(req.user_agent, "Sable/1.0") { http_request_free(req); return 72 }
+    http_request_timeout(req, 1500)
+    if req.timeout_ms != 1500 { http_request_free(req); return 73 }
+    http_request_follow_redirects(req, false)
+    if req.follow_redirects != 0 { http_request_free(req); return 74 }
+    http_request_free(req)
+
+    // query string builder with percent encoding
+    let keys = malloc(16) as *int
+    let vals = malloc(16) as *int
+    if keys == 0 or vals == 0 { if keys != 0 { free(keys) } if vals != 0 { free(vals) } return 75 }
+    keys[0] = "name" as int
+    keys[1] = "q" as int
+    vals[0] = "sa ble" as int
+    vals[1] = "a&b" as int
+    let qs = http_build_query(keys as ptr, vals as ptr, 2)
+    if !text_eq(qs, "name=sa%20ble&q=a%26b") { free(qs); free(keys); free(vals); return 76 }
+    free(qs)
+    free(keys)
+    free(vals)
+
+    // response header lookup (case-insensitive, trimmed).
+    // note: pass heap strings (clones) because the response owns and frees them;
+    // a literal lives in the PE image and must never reach HeapFree.
+    let hdr_lit = "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nServer: nginx\r\nX-Padded:   value here   \r\n\r\n"
+    let raw = string_substring(hdr_lit, 0, string_length(hdr_lit))
+    let resp = http_response_new_full(200, string_substring("body", 0, 4), raw)
+    if resp == 0 { return 77 }
+    let rct = http_response_content_type(resp)
+    if !text_eq(rct, "text/html; charset=utf-8") { free(rct); http_response_free(resp); return 78 }
+    free(rct)
+    let srv = http_response_header(resp, "SERVER")
+    if !text_eq(srv, "nginx") { free(srv); http_response_free(resp); return 79 }
+    free(srv)
+    let padded = http_response_header(resp, "x-padded")
+    if !text_eq(padded, "value here") { free(padded); http_response_free(resp); return 80 }
+    free(padded)
+    if http_response_header(resp, "Absent") != 0 { http_response_free(resp); return 81 }
+    http_response_free(resp)
     return 0
 }
 

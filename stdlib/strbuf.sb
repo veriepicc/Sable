@@ -1,0 +1,263 @@
+import mem
+
+// Growable string builder.
+//
+// Appending N pieces to a strbuf costs O(total) instead of the O(N * total) that
+// repeated string_append would cost, because the buffer grows geometrically and
+// the final string is materialized only once.
+//
+// Ownership:
+// - strbuf_new / strbuf_with_capacity allocate; the caller owns the handle and
+//   must release it with strbuf_free.
+// - strbuf_to_string returns a NEW heap string; freeing the builder does not free
+//   it, and freeing the string does not touch the builder.
+//
+// Layout: the handle is a view over a 24-byte header.
+//   [0]  data : ptr -> heap block of `cap` bytes
+//   [8]  len  : int -> bytes written so far
+//   [16] cap  : int -> allocated bytes
+
+view StrBuf {
+    data: ptr @ 0
+    len: int @ 8
+    cap: int @ 16
+}
+
+// initial capacity for a builder created without an explicit size
+let STRBUF_MIN_CAPACITY: int = 32
+
+function StrBuf strbuf_alloc_handle() {
+    var handle = malloc(24) as StrBuf
+    if handle != 0 {
+        handle.data = 0
+        handle.len = 0
+        handle.cap = 0
+    }
+    return handle
+}
+
+function StrBuf strbuf_with_capacity(int capacity) {
+    var want = capacity
+    if want < STRBUF_MIN_CAPACITY {
+        want = STRBUF_MIN_CAPACITY
+    }
+    let block = mem.make_zero(want)
+    if block == 0 {
+        return 0 as StrBuf
+    }
+    let handle = strbuf_alloc_handle()
+    if handle == 0 {
+        free(block)
+        return 0 as StrBuf
+    }
+    handle.data = block
+    handle.len = 0
+    handle.cap = want
+    return handle
+}
+
+function StrBuf strbuf_new() {
+    return strbuf_with_capacity(STRBUF_MIN_CAPACITY)
+}
+
+function void strbuf_free(StrBuf buf) {
+    if buf == 0 {
+        return
+    }
+    if buf.data != 0 {
+        free(buf.data)
+        buf.data = 0
+    }
+    free(buf)
+}
+
+function int strbuf_len(StrBuf buf) {
+    if buf == 0 {
+        return 0
+    }
+    return buf.len
+}
+
+function int strbuf_capacity(StrBuf buf) {
+    if buf == 0 {
+        return 0
+    }
+    return buf.cap
+}
+
+function bool strbuf_is_empty(StrBuf buf) {
+    return strbuf_len(buf) == 0
+}
+
+function void strbuf_clear(StrBuf buf) {
+    if buf == 0 {
+        return
+    }
+    buf.len = 0
+    if buf.data != 0 && buf.cap > 0 {
+        mem.write8(buf.data, 0)
+    }
+}
+
+// grow the backing block so it can hold at least `needed` bytes. returns false on
+// allocation failure (the builder keeps its previous contents).
+function bool strbuf_reserve(StrBuf buf, int needed) {
+    if buf == 0 {
+        return false
+    }
+    if needed <= buf.cap {
+        return true
+    }
+    var want = buf.cap
+    if want < STRBUF_MIN_CAPACITY {
+        want = STRBUF_MIN_CAPACITY
+    }
+    while want < needed {
+        let previous = want
+        want = want + (want >> 1)
+        if want <= previous {
+            want = previous + 1
+        }
+    }
+    let block = mem.make_zero(want)
+    if block == 0 {
+        return false
+    }
+    if buf.data != 0 && buf.len > 0 {
+        memcpy(block, buf.data, buf.len)
+        free(buf.data)
+    }
+    buf.data = block
+    buf.cap = want
+    return true
+}
+
+// append one byte. returns false only on allocation failure.
+function bool strbuf_push_byte(StrBuf buf, int byte_value) {
+    if buf == 0 {
+        return false
+    }
+    if !strbuf_reserve(buf, buf.len + 1) {
+        return false
+    }
+    mem.write8(buf.data + buf.len, byte_value & 0xFF)
+    buf.len = buf.len + 1
+    return true
+}
+
+// append a string's bytes (no null terminator is written). a null string is a
+// no-op, so it is safe to append an optional value.
+function bool strbuf_append(StrBuf buf, str text_value) {
+    if buf == 0 {
+        return false
+    }
+    if text_value == 0 {
+        return true
+    }
+    let n = string_length(text_value)
+    if n <= 0 {
+        return true
+    }
+    if !strbuf_reserve(buf, buf.len + n) {
+        return false
+    }
+    memcpy(buf.data + buf.len, text_value as ptr, n)
+    buf.len = buf.len + n
+    return true
+}
+
+// append a bounded slice of a string: bytes [start, start+count).
+function bool strbuf_append_slice(StrBuf buf, str text_value, int start, int count) {
+    if buf == 0 {
+        return false
+    }
+    if text_value == 0 || count <= 0 {
+        return true
+    }
+    var offset = start
+    var n = count
+    let total = string_length(text_value)
+    if offset < 0 {
+        n = n + offset
+        offset = 0
+    }
+    if offset >= total || n <= 0 {
+        return true
+    }
+    if offset + n > total {
+        n = total - offset
+    }
+    if !strbuf_reserve(buf, buf.len + n) {
+        return false
+    }
+    memcpy(buf.data + buf.len, (text_value as ptr) + offset, n)
+    buf.len = buf.len + n
+    return true
+}
+
+// append a signed integer in base 10.
+function bool strbuf_append_int(StrBuf buf, i64 value) {
+    if buf == 0 {
+        return false
+    }
+    return strbuf_append(buf, int_to_string(value))
+}
+
+// append `count` copies of a single byte.
+function bool strbuf_append_repeat(StrBuf buf, int byte_value, int count) {
+    if buf == 0 {
+        return false
+    }
+    if count <= 0 {
+        return true
+    }
+    if !strbuf_reserve(buf, buf.len + count) {
+        return false
+    }
+    memset(buf.data + buf.len, byte_value & 0xFF, count)
+    buf.len = buf.len + count
+    return true
+}
+
+// current contents as a str view into the builder's own storage. valid until the
+// next append that grows the block or the next strbuf_free. this may reserve one
+// extra byte for the terminator, so do not hold a view across an append.
+function str strbuf_view(StrBuf buf) {
+    if buf == 0 || buf.data == 0 {
+        return "" as str
+    }
+    return strbuf_terminate_view(buf)
+}
+
+// ensure a null terminator after the used bytes, then return the data pointer as a
+// str. the terminator lives in the capacity (reserve guarantees room for one extra
+// byte beyond what has been appended).
+function str strbuf_terminate_view(StrBuf buf) {
+    if buf == 0 || buf.data == 0 {
+        return "" as str
+    }
+    if !strbuf_reserve(buf, buf.len + 1) {
+        return "" as str
+    }
+    mem.write8(buf.data + buf.len, 0)
+    return buf.data as str
+}
+
+// materialize the contents as a fresh heap string. empty builders yield an empty
+// string, never a null.
+function str strbuf_to_string(StrBuf buf) {
+    if buf == 0 || buf.data == 0 || buf.len <= 0 {
+        return make_string("")
+    }
+    return string_substring(strbuf_view(buf), 0, buf.len)
+}
+
+// materialize the contents as a fresh heap string and reset the builder to empty.
+function str strbuf_take_string(StrBuf buf) {
+    if buf == 0 || buf.data == 0 || buf.len <= 0 {
+        return make_string("")
+    }
+    let result = string_substring(strbuf_view(buf), 0, buf.len)
+    strbuf_clear(buf)
+    return result
+}

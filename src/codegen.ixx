@@ -97,6 +97,14 @@ struct Symbol {
     std::int32_t stack_offset;  // Offset from RBP (negative = local)
     bool is_param = false;
     bool is_mut = false;
+    // known element count for a fixed-size array binding (nullopt = unknown). set
+    // for array literal initializers, string literals, and `T[N]` declarations,
+    // used for compile-time out-of-bounds diagnostics.
+    std::optional<std::size_t> array_len = std::nullopt;
+    // true when this binding owns a heap array with a length header at [base-16]
+    // (array-literal initializer under native-image output); enables the runtime
+    // bounds guard for computed indices.
+    bool is_heap_array = false;
 };
 
 struct Scope {
@@ -260,6 +268,7 @@ public:
             } else if (decl->is<ast::FnDecl>()) {
                 const auto& fn = decl->as<ast::FnDecl>();
                 if (!claim_symbol_name(function_owners_, "function", fn.name, current_symbol_owner())) return false;
+                if (!check_duplicate_params("function", fn.name, fn.params)) return false;
                 if (!register_resolved_fn_support(fn)) return false;
                 auto resolved_ret = resolve_fn_decl_return_type(fn);
                 if (!resolved_ret) return false;
@@ -416,6 +425,17 @@ public:
         auto size = buf.pos();
         if (size < 6) return;
 
+        // a branch may land inside an instruction's byte range; never rewrite one
+        auto reachable = [&](std::size_t start, std::size_t len) {
+            const auto& targets = emit_.jump_targets();
+            for (std::size_t b = start; b < start + len; ++b) {
+                if (targets.contains(b)) {
+                    return true;
+                }
+            }
+            return false;
+        };
+
         int eliminated = 0;
 
         // pass 1: eliminate mov dst,src; mov src,dst (copy-back redundancy)
@@ -443,6 +463,7 @@ public:
 
             // eliminate mov reg,reg where dst == src (identity move)
             if (full_reg1 == full_rm1) {
+                if (reachable(i, 3)) { i += 3; continue; }
                 code[i] = 0x90; code[i+1] = 0x90; code[i+2] = 0x90;
                 eliminated++;
                 i += 3;
@@ -467,6 +488,9 @@ public:
                 std::uint8_t full_rm2 = rm2_field + (rm2_ext ? 8 : 0);
 
                 if (full_reg1 == full_rm2 && full_rm1 == full_reg2) {
+                    // only safe when neither mov is a branch landing spot: a jump to
+                    // the second mov would otherwise lose the value it copies back.
+                    if (reachable(i, 6)) { i += 6; continue; }
                     code[i+3] = 0x90; code[i+4] = 0x90; code[i+5] = 0x90;
                     eliminated++;
                     i += 6;
@@ -1603,17 +1627,27 @@ private:
         return false;
     }
 
-    std::unordered_set<std::uint8_t> scratch_regs_in_use_;
+    // refcounted so nested ScopedScratchReg guards on the same register stack
+    // correctly; a plain set would let the inner destructor release a register
+    // the outer frame is still holding live.
+    std::unordered_map<std::uint8_t, std::size_t> scratch_regs_in_use_;
 
     struct ScopedScratchReg {
         CodeGenerator& cg;
         x64::Reg reg;
         ScopedScratchReg(CodeGenerator& cg, x64::Reg reg) : cg(cg), reg(reg) {
-            cg.scratch_regs_in_use_.insert(static_cast<std::uint8_t>(reg));
+            ++cg.scratch_regs_in_use_[static_cast<std::uint8_t>(reg)];
         }
         ~ScopedScratchReg() {
-            cg.scratch_regs_in_use_.erase(static_cast<std::uint8_t>(reg));
+            auto it = cg.scratch_regs_in_use_.find(static_cast<std::uint8_t>(reg));
+            if (it != cg.scratch_regs_in_use_.end()) {
+                if (--it->second == 0) {
+                    cg.scratch_regs_in_use_.erase(it);
+                }
+            }
         }
+        ScopedScratchReg(const ScopedScratchReg&) = delete;
+        ScopedScratchReg& operator=(const ScopedScratchReg&) = delete;
     };
 
     [[nodiscard]] bool reg_is_bound(x64::Reg reg) const {
@@ -1735,14 +1769,18 @@ private:
 
     void patch_rel32(std::size_t patch_site, std::size_t target) {
         emit_.buffer().patch32(patch_site, static_cast<std::uint32_t>(rel32_from_patch(patch_site, target)));
+        emit_.note_jump_target(target);
     }
 
     [[nodiscard]] std::int32_t rel32_from_next_jmp(std::size_t target) {
         return emit_.buffer().rel32(emit_.buffer().pos() + 1, target);
     }
 
+    // `emit_.jmp_rel32(offset)` writes a raw jump whose target is not otherwise
+    // recorded; compute and record it so the peephole cannot delete the landing spot.
     void emit_jmp_rel32_to(std::size_t target) {
         emit_.jmp_rel32(rel32_from_next_jmp(target));
+        emit_.note_jump_target(target);
     }
 
     void emit_current_epilogue() {
@@ -2450,6 +2488,36 @@ private:
         error(std::format("{} '{}' from '{}' conflicts with {} from '{}'",
             kind, name, owner, kind, it->second));
         return false;
+    }
+
+    // human-readable name for a type, used in diagnostics
+    [[nodiscard]] static std::string type_display_name(const Type& type) {
+        return std::visit(overloaded{
+            [](PrimitiveType p) { return std::string(primitive_name(p)); },
+            [](const PointerType& p) {
+                return std::string("*") + (p.pointee ? type_display_name(*p.pointee) : std::string("?"));
+            },
+            [](const std::string& name) { return name; },
+            [](const StructType& s) { return s.name; },
+            [](const ArrayType& a) {
+                return (a.element ? type_display_name(*a.element) : std::string("?")) + "[]";
+            },
+            [](const FunctionType&) { return std::string("fn"); },
+        }, type.kind);
+    }
+
+    // reject two parameters sharing a name: the second silently shadows the first,
+    // so the body always reads one of them and the other is dead.
+    [[nodiscard]] bool check_duplicate_params(std::string_view kind, const std::string& name,
+                                              const ast::ParamList& params) {
+        std::unordered_set<std::string> seen;
+        for (const auto& p : params) {
+            if (!seen.insert(p.name).second) {
+                error(std::format("{} '{}' declares parameter '{}' more than once", kind, name, p.name));
+                return false;
+            }
+        }
+        return true;
     }
 
     std::string display_module_path(std::string_view canonical) const {
@@ -3599,10 +3667,17 @@ private:
         StructInfo info;
         info.name = s.name;
         for (const auto& [name, type] : s.fields) {
+            if (info.field_offsets.contains(name)) {
+                error(std::format("struct '{}' declares field '{}' more than once", s.name, name));
+                return false;
+            }
             auto resolved = canonicalize_type(type);
             if (!resolved) return false;
             info.fields.emplace_back(name, std::move(*resolved));
+            // reserve the slot now so a later duplicate is detected
+            info.field_offsets[name] = info.fields.size() - 1;
         }
+        info.field_offsets.clear();
         info.calculate_offsets();
         structs_[s.name] = std::move(info);
         return true;
@@ -3615,6 +3690,10 @@ private:
         info.name = v.name;
         info.is_view = true;
         for (const auto& field : v.fields) {
+            if (info.field_offsets.contains(field.name)) {
+                error(std::format("view '{}' declares field '{}' more than once", v.name, field.name));
+                return false;
+            }
             auto resolved = canonicalize_type(field.type);
             if (!resolved) return false;
             auto offset_opt = resolve_view_field_offset(field);
@@ -3644,10 +3723,16 @@ private:
         StructInfo info;
         info.name = c.name;
         for (const auto& [name, type] : c.fields) {
+            if (info.field_offsets.contains(name)) {
+                error(std::format("class '{}' declares field '{}' more than once", c.name, name));
+                return false;
+            }
             auto resolved = canonicalize_type(type);
             if (!resolved) return false;
             info.fields.emplace_back(name, std::move(*resolved));
+            info.field_offsets[name] = info.fields.size() - 1;
         }
+        info.field_offsets.clear();
         info.calculate_offsets();
         structs_[c.name] = std::move(info);
         
@@ -3778,6 +3863,10 @@ private:
         std::unordered_map<std::string, std::int64_t> variants;
         std::int64_t next_value = 0;
         for (const auto& [name, value] : e.variants) {
+            if (variants.contains(name)) {
+                error(std::format("enum '{}' declares variant '{}' more than once", e.name, name));
+                return false;
+            }
             if (value) {
                 next_value = *value;
             }
@@ -3788,9 +3877,121 @@ private:
         return true;
     }
 
-    [[nodiscard]] static bool expr_contains_call(const ast::Expr& expr) {
+    // true when an expression contains a division or modulo. the idiv/cqo sequence
+    // writes its remainder into RDX, so a function body with one of these must not
+    // keep any value registerized in RDX across it (see try_make_function_leaf_register_plan).
+    [[nodiscard]] static bool expr_contains_divmod(const ast::Expr& expr) {
         return std::visit(overloaded{
             [&](const ast::LiteralExpr&) { return false; },
+            [&](const ast::IdentExpr&) { return false; },
+            [&](const ast::UnaryExpr& e) { return e.operand && expr_contains_divmod(*e.operand); },
+            [&](const ast::BinaryExpr& e) {
+                if (e.op == ast::BinaryExpr::Op::Div || e.op == ast::BinaryExpr::Op::Mod ||
+                    e.op == ast::BinaryExpr::Op::DivAssign || e.op == ast::BinaryExpr::Op::ModAssign) {
+                    return true;
+                }
+                return (e.lhs && expr_contains_divmod(*e.lhs)) ||
+                       (e.rhs && expr_contains_divmod(*e.rhs));
+            },
+            [&](const ast::IndexExpr& e) {
+                return (e.base && expr_contains_divmod(*e.base)) ||
+                       (e.index && expr_contains_divmod(*e.index));
+            },
+            [&](const ast::FieldExpr& e) { return e.base && expr_contains_divmod(*e.base); },
+            [&](const ast::CastExpr& e) { return e.expr && expr_contains_divmod(*e.expr); },
+            [&](const ast::CallExpr& e) {
+                if (e.callee && expr_contains_divmod(*e.callee)) return true;
+                for (const auto& a : e.args) {
+                    if (a && expr_contains_divmod(*a)) return true;
+                }
+                return false;
+            },
+            [&](const ast::FStringExpr& e) {
+                for (const auto& part : e.parts) {
+                    if (part.expr && expr_contains_divmod(*part.expr)) return true;
+                }
+                return false;
+            },
+            [&](const ast::ArrayExpr& e) {
+                for (const auto& el : e.elements) {
+                    if (el && expr_contains_divmod(*el)) return true;
+                }
+                return false;
+            },
+            [&](const ast::StructExpr& e) {
+                for (const auto& [_, v] : e.fields) {
+                    if (v && expr_contains_divmod(*v)) return true;
+                }
+                return false;
+            },
+            [&](const auto&) { return false; },
+        }, expr.kind);
+    }
+
+    [[nodiscard]] static bool stmt_contains_divmod(const ast::Stmt& stmt) {
+        return std::visit(overloaded{
+            [&](const ast::LetStmt& s) { return s.init && expr_contains_divmod(*s.init); },
+            [&](const ast::ExprStmt& s) { return s.expr && expr_contains_divmod(*s.expr); },
+            [&](const ast::ReturnStmt& s) { return s.value && expr_contains_divmod(*s.value); },
+            [&](const ast::IfStmt& s) {
+                if (s.condition && expr_contains_divmod(*s.condition)) return true;
+                for (const auto& inner : s.then_block) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                if (s.else_block) {
+                    for (const auto& inner : *s.else_block) {
+                        if (stmt_contains_divmod(*inner)) return true;
+                    }
+                }
+                return false;
+            },
+            [&](const ast::SwitchStmt& s) {
+                if (s.subject && expr_contains_divmod(*s.subject)) return true;
+                for (const auto& branch : s.cases) {
+                    if (branch.value && expr_contains_divmod(*branch.value)) return true;
+                    for (const auto& inner : branch.body) {
+                        if (stmt_contains_divmod(*inner)) return true;
+                    }
+                }
+                if (s.else_block) {
+                    for (const auto& inner : *s.else_block) {
+                        if (stmt_contains_divmod(*inner)) return true;
+                    }
+                }
+                return false;
+            },
+            [&](const ast::WhileStmt& s) {
+                if (s.condition && expr_contains_divmod(*s.condition)) return true;
+                for (const auto& inner : s.body) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                return false;
+            },
+            [&](const ast::ForStmt& s) {
+                if (s.iterable && expr_contains_divmod(*s.iterable)) return true;
+                for (const auto& inner : s.body) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                return false;
+            },
+            [&](const ast::LoopStmt& s) {
+                for (const auto& inner : s.body) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                return false;
+            },
+            [&](const ast::BlockStmt& s) {
+                for (const auto& inner : s.block.stmts) {
+                    if (stmt_contains_divmod(*inner)) return true;
+                }
+                return false;
+            },
+            [&](const auto&) { return false; },
+        }, stmt.kind);
+    }
+
+    [[nodiscard]] static bool expr_contains_call(const ast::Expr& expr) {
+        return std::visit(overloaded{            [&](const ast::LiteralExpr&) { return false; },
             [&](const ast::IdentExpr&) { return false; },
             [&](const ast::UnaryExpr& e) { return expr_contains_call(*e.operand); },
             [&](const ast::BinaryExpr& e) { return expr_contains_call(*e.lhs) || expr_contains_call(*e.rhs); },
@@ -4171,10 +4372,30 @@ private:
             }
         }
 
+        // a body containing a division or modulo uses RDX as the idiv scratch
+        // register (cqo writes the sign into RDX, idiv overwrites it with the
+        // remainder). registering any live value in RDX there would store a value
+        // into a register the divide destroys, so exclude RDX entirely.
+        bool body_has_divmod = false;
+        for (const auto& stmt : body) {
+            if (stmt_contains_divmod(*stmt)) {
+                body_has_divmod = true;
+                break;
+            }
+        }
+
         plan.param_regs.clear();
         plan.local_regs.clear();
         std::unordered_set<x64::Reg> used_regs;
+        if (body_has_divmod) {
+            used_regs.insert(x64::Reg::RDX);
+        }
         for (std::size_t i = 0; i < fn.params.size(); ++i) {
+            // a divmod body must not keep a live parameter in RDX (the divide
+            // clobbers it). leave that parameter in its stack slot instead.
+            if (body_has_divmod && x64::ARG_REGS[i] == x64::Reg::RDX) {
+                continue;
+            }
             plan.param_regs[fn.params[i].name] = x64::ARG_REGS[i];
             used_regs.insert(x64::ARG_REGS[i]);
         }
@@ -5987,6 +6208,29 @@ private:
         if (auto it = pending_named_register_bindings_.find(let.name); it != pending_named_register_bindings_.end()) {
             register_bindings_[&sym] = it->second;
         }
+        // track the element count of fixed-size array bindings so a literal index
+        // can be bounds-checked at compile time
+        if (let.init) {
+            if (auto* arr_lit = std::get_if<ast::ArrayExpr>(&let.init->kind)) {
+                sym.array_len = arr_lit->elements.size();
+                // only an immutable binding keeps this exact array for the whole
+                // scope, so the runtime bounds guard can trust its header
+                sym.is_heap_array = !let.is_mut;
+            } else if (auto* lit = std::get_if<ast::LiteralExpr>(&let.init->kind)) {
+                // a string literal binding: its length bounds a literal index
+                if (auto* s = std::get_if<std::string>(&lit->value)) {
+                    sym.array_len = s->size();
+                }
+            }
+        }
+        if (!sym.array_len && let.type) {
+            auto resolved = canonicalize_type(*let.type);
+            if (resolved) {
+                if (auto* arr_ty = std::get_if<ArrayType>(&resolved->kind); arr_ty && arr_ty->size) {
+                    sym.array_len = *arr_ty->size;
+                }
+            }
+        }
         return &sym;
     }
 
@@ -6031,6 +6275,9 @@ private:
                     return false;
                 }
                 const auto& info = struct_it->second;
+                if (!check_struct_literal_fields(lit, info)) {
+                    return false;
+                }
                 for (const auto& [field_name, value_expr] : lit.fields) {
                     auto offset_opt = info.get_field_offset(field_name);
                     if (!offset_opt) {
@@ -6062,11 +6309,22 @@ private:
                 return false;
             }
             std::size_t size = struct_it->second.total_size > 0 ? struct_it->second.total_size : 8;
+            // a null struct source must not fault: zero the destination instead
+            emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            for (std::size_t offset = 0; offset < size; offset += 8) {
+                auto chunk = static_cast<std::int32_t>(offset);
+                emit_.xor_(x64::Reg::R11, x64::Reg::R11);
+                emit_.mov_store(x64::Reg::RBP, sym.stack_offset + chunk, x64::Reg::R11);
+            }
+            std::size_t done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
             for (std::size_t offset = 0; offset < size; offset += 8) {
                 auto chunk = static_cast<std::int32_t>(offset);
                 emit_.mov_load(x64::Reg::R11, x64::Reg::RAX, chunk);
                 emit_.mov_store(x64::Reg::RBP, sym.stack_offset + chunk, x64::Reg::R11);
             }
+            emit_.patch_jump(done);
             if (auto bound = lookup_bound_reg(&sym)) {
                 emit_.lea(*bound, x64::Reg::RBP, sym.stack_offset);
             }
@@ -6901,8 +7159,30 @@ private:
         }
         current_function_return_seen_ = true;
         if (ret.value) {
+            // returning a value from a function that does not return one: the value
+            // is silently discarded and the caller reads garbage. reject it.
+            if (has_current_function_return_type_ && current_function_return_type_.is_void()) {
+                error("returning a value from a function with no return type");
+                return false;
+            }
+            // returning the result of a void call: there is nothing to return.
+            if (auto* call = std::get_if<ast::CallExpr>(&ret.value->kind);
+                call && call->callee && call->callee->is<ast::IdentExpr>()) {
+                auto it = functions_.find(resolve_function_name(call->callee->as<ast::IdentExpr>().name));
+                if (it != functions_.end() && it->second.return_type.is_void()) {
+                    error(std::format("cannot return the result of '{}', which returns void",
+                                      call->callee->as<ast::IdentExpr>().name));
+                    return false;
+                }
+            }
             if (!generate_expr(*ret.value)) return false;
         } else {
+            // `return` with no value in a function that must produce one: the caller
+            // reads RAX uninitialised.
+            if (has_current_function_return_type_ && !current_function_return_type_.is_void()) {
+                error("return with no value from a function that returns a value");
+                return false;
+            }
             emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
         }
         if (has_active_defers_to_function_root()) {
@@ -7188,6 +7468,110 @@ private:
             "virtual_free",
         };
         return std::find(kReleaseBuiltins.begin(), kReleaseBuiltins.end(), name) != kReleaseBuiltins.end();
+    }
+
+    // Does `stmt` (recursively) call a release builtin on the named identifier?
+    // Used to decide whether a callee takes ownership of a parameter, so a call
+    // site passing a string literal can be flagged before it reaches HeapFree.
+    [[nodiscard]] static bool stmt_releases_named_value(const ast::Stmt& stmt, std::string_view name) {
+        struct Walker {
+            std::string_view name;
+            [[nodiscard]] bool expr_calls_release(const ast::Expr& expr) const {
+                if (auto* call = std::get_if<ast::CallExpr>(&expr.kind)) {
+                    if (call->callee->is<ast::IdentExpr>()) {
+                        const auto& callee_name = call->callee->as<ast::IdentExpr>().name;
+                        if (is_obvious_owner_release_builtin(callee_name) && !call->args.empty() &&
+                            call->args[0]->is<ast::IdentExpr>() &&
+                            call->args[0]->as<ast::IdentExpr>().name == name) {
+                            return true;
+                        }
+                    }
+                    for (const auto& arg : call->args) {
+                        if (expr_calls_release(*arg)) return true;
+                    }
+                }
+                if (auto* bin = std::get_if<ast::BinaryExpr>(&expr.kind)) {
+                    return expr_calls_release(*bin->lhs) || expr_calls_release(*bin->rhs);
+                }
+                if (auto* un = std::get_if<ast::UnaryExpr>(&expr.kind)) {
+                    return expr_calls_release(*un->operand);
+                }
+                if (auto* cast = std::get_if<ast::CastExpr>(&expr.kind)) {
+                    return expr_calls_release(*cast->expr);
+                }
+                return false;
+            }
+            [[nodiscard]] bool suite_releases(const ast::StmtSuite& suite) const {
+                for (const auto& s : suite.stmts) {
+                    if (stmt_releases_named_value(*s, name)) return true;
+                }
+                return false;
+            }
+        } walker{name};
+
+        return std::visit(overloaded{
+            [&](const ast::ExprStmt& s) -> bool { return s.expr && walker.expr_calls_release(*s.expr); },
+            [&](const ast::LetStmt& s) -> bool { return s.init && walker.expr_calls_release(*s.init); },
+            [&](const ast::ReturnStmt& s) -> bool { return s.value && walker.expr_calls_release(*s.value); },
+            [&](const ast::DeferStmt& s) -> bool {
+                return s.stmt && stmt_releases_named_value(*s.stmt, name);
+            },
+            [&](const ast::IfStmt& s) -> bool {
+                if (s.condition && walker.expr_calls_release(*s.condition)) return true;
+                if (walker.suite_releases(s.then_block)) return true;
+                if (s.has_else() && walker.suite_releases(*s.else_block)) return true;
+                return false;
+            },
+            [&](const ast::WhileStmt& s) -> bool {
+                if (s.condition && walker.expr_calls_release(*s.condition)) return true;
+                return walker.suite_releases(s.body);
+            },
+            [&](const ast::ForStmt& s) -> bool { return walker.suite_releases(s.body); },
+            [&](const ast::LoopStmt& s) -> bool { return walker.suite_releases(s.body); },
+            [&](const ast::BlockStmt& s) -> bool { return walker.suite_releases(s.block.stmts); },
+            [&](const ast::SwitchStmt&) -> bool { return false; },
+            [&](const auto&) -> bool { return false; },
+        }, stmt.kind);
+    }
+
+    // Which parameters of a user-defined callee get handed to free()/array_free()?
+    [[nodiscard]] std::vector<std::string> callee_owned_params(std::string_view callee_name) {
+        std::vector<std::string> owned;
+        auto it = functions_.find(std::string(callee_name));
+        if (it == functions_.end() || !it->second.decl) {
+            return owned;
+        }
+        const ast::FnDecl& decl = *it->second.decl;
+        if (!decl.has_body()) {
+            return owned;
+        }
+        for (const auto& param : decl.params) {
+            if (param.type.is_primitive()) {
+                // only string/pointer params can be heap-owned
+                auto* p = std::get_if<PrimitiveType>(&param.type.kind);
+                if (!p || (*p != PrimitiveType::Str && *p != PrimitiveType::Ptr &&
+                           *p != PrimitiveType::U8 && *p != PrimitiveType::I8)) {
+                    continue;
+                }
+            }
+            for (const auto& stmt : decl.body_ref().stmts) {
+                if (stmt_releases_named_value(*stmt, param.name)) {
+                    owned.push_back(param.name);
+                    break;
+                }
+            }
+        }
+        return owned;
+    }
+
+    [[nodiscard]] static bool expr_is_string_literal(const ast::Expr& expr) {
+        if (auto* cast = std::get_if<ast::CastExpr>(&expr.kind)) {
+            return expr_is_string_literal(*cast->expr);
+        }
+        if (auto* lit = std::get_if<ast::LiteralExpr>(&expr.kind)) {
+            return std::holds_alternative<std::string>(lit->value);
+        }
+        return false;
     }
 
     [[nodiscard]] bool expr_obviously_produces_owned_value(const ast::Expr& expr) {
@@ -10483,6 +10867,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
     [[nodiscard]] bool emit_condition_false_jump(const ast::Expr& condition, std::size_t& jump_patch) {
         if (auto* bin = std::get_if<ast::BinaryExpr>(&condition.kind)) {
+            if (!validate_binary_operands(*bin)) {
+                return false;
+            }
             // type-context guard for the comparison so unsigned-aware cc is selected
             BinaryOpTypeGuard cond_guard(this, infer_expr_type(*bin->lhs));
             // float comparisons can't use the integer cmp fast paths
@@ -10498,7 +10885,12 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     if (current_scope_ && bin->lhs->is<ast::IdentExpr>() &&
                         rhs_imm >= (std::numeric_limits<std::int32_t>::min)() &&
                         rhs_imm <= (std::numeric_limits<std::int32_t>::max)()) {
-                        if (Symbol* sym = current_scope_->lookup(bin->lhs->as<ast::IdentExpr>().name)) {
+                        // the inline alias wins: inside an inlined body the alias is
+                        // the function's parameter and must shadow a caller local of
+                        // the same name
+                        const ast::Expr* inlined = current_scope_->lookup_inline(bin->lhs->as<ast::IdentExpr>().name);
+                        Symbol* sym = inlined ? nullptr : current_scope_->lookup(bin->lhs->as<ast::IdentExpr>().name);
+                        if (sym) {
                             if (auto bound = lookup_bound_reg(sym)) {
                                 emit_.cmp_smart_imm(*bound, rhs_imm);
                                 jump_patch = emit_.jcc_rel32(*false_cc);
@@ -10546,13 +10938,16 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     while (cur && cur->is<ast::IdentExpr>()) {
                         if (!current_scope_) return std::nullopt;
                         const auto& name = cur->as<ast::IdentExpr>().name;
-                        if (Symbol* sym = current_scope_->lookup(name)) {
-                            if (stack_struct_locals_.contains(sym)) return std::nullopt;
-                            return lookup_bound_reg(sym);
-                        }
+                        // the inline alias wins: inside an inlined body the alias is
+                        // the function's parameter and must shadow a caller local of
+                        // the same name
                         if (const ast::Expr* inlined = current_scope_->lookup_inline(name)) {
                             cur = inlined;
                             continue;
+                        }
+                        if (Symbol* sym = current_scope_->lookup(name)) {
+                            if (stack_struct_locals_.contains(sym)) return std::nullopt;
+                            return lookup_bound_reg(sym);
                         }
                         return std::nullopt;
                     }
@@ -10685,36 +11080,58 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
     // Signed 64-bit divide that's safe against the INT_MIN / -1 hardware trap.
     // After the call, RAX = quotient, RDX = remainder. dividend must already be in RAX.
-    void emit_safe_idiv(x64::Reg divisor) {
-        // if divisor == -1 and rax == INT64_MIN, idiv would trap (#DE).
-        // we patch the result to (INT64_MIN, 0) to match wrapping semantics without faulting.
-        // constraint set: the dividend lives in RAX, the divisor may BE RDX (which cqo
-        // clobbers), and every other register can hold live data inside registerized
-        // loops. so: park the divisor on the stack, run the guard without touching any
-        // register, and idiv straight from memory.
+    // unsigned div/mod: guard only the zero divisor (#DE), yield 0/0.
+    // divisor lives in `divisor`; dividend must be in RAX with RDX already zeroed.
+    void emit_safe_udiv(x64::Reg divisor) {
         emit_.push(divisor);
-        emit_.cmp_mem_imm(x64::Reg::RSP, 0, -1);
-        std::size_t do_idiv = emit_.jcc_rel32(x64::Emitter::CC_NE);
-        // divisor == -1: trap only when rax == INT64_MIN. detect it on a scratch copy
-        // via shifts — shl sets CF = old bit63 and SF = old bit62; INT64_MIN is the
-        // only value with bit63=1 and bit62=0.
-        emit_.push(x64::Reg::RAX);
-        emit_.shl_imm(x64::Reg::RAX, 1);
-        std::size_t not_min_a = emit_.jcc_rel32(x64::Emitter::CC_AE);
-        std::size_t not_min_b = emit_.jcc_rel32(x64::Emitter::CC_NS);
-        // trap path: rax still holds INT64_MIN untouched; rdx:rax = (INT64_MIN, 0)
-        emit_.add_imm(x64::Reg::RSP, 8);
+        emit_.cmp_mem_imm(x64::Reg::RSP, 0, 0);
+        std::size_t nonzero = emit_.jcc_rel32(x64::Emitter::CC_NE);
+        // zero divisor: quotient 0 in RAX, remainder 0 in RDX
+        emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
         emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
         emit_.add_imm(x64::Reg::RSP, 8);
+        std::size_t done = emit_.jmp_rel32_placeholder();
+        emit_.patch_jump(nonzero);
+        emit_.div_mem(x64::Reg::RSP, 0);
+        emit_.add_imm(x64::Reg::RSP, 8);
+        emit_.patch_jump(done);
+    }
+
+    void emit_safe_idiv(x64::Reg divisor) {        // idiv traps (#DE) on two inputs: a zero divisor, and INT64_MIN / -1.
+        // neither should crash a running program, so both are guarded here and
+        // patched to a defined result.
+        //   divisor == 0   -> result 0, remainder 0
+        //   INT64_MIN / -1 -> result INT64_MIN, remainder 0
+        // constraint set: the dividend lives in RAX, the divisor may BE RDX (which
+        // cqo clobbers), and every other register can hold live data inside
+        // registerized loops. so: park the divisor on the stack, run the guards
+        // without touching any register, and idiv straight from memory.
+        emit_.push(divisor);
+
+        // zero divisor: result 0, remainder 0, skip the divide entirely
+        emit_.cmp_mem_imm(x64::Reg::RSP, 0, 0);
+        std::size_t nonzero_div = emit_.jcc_rel32(x64::Emitter::CC_NE);
+        emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
+        emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
+        emit_.add_imm(x64::Reg::RSP, 8);
+        std::size_t after_zero = emit_.jmp_rel32_placeholder();
+        emit_.patch_jump(nonzero_div);
+
+        emit_.cmp_mem_imm(x64::Reg::RSP, 0, -1);
+        std::size_t do_idiv = emit_.jcc_rel32(x64::Emitter::CC_NE);
+        // divisor == -1: negating the dividend is the quotient, and negation of
+        // INT64_MIN wraps to INT64_MIN, which is exactly the wrapping result we
+        // want. remainder is 0 either way.
+        emit_.add_imm(x64::Reg::RSP, 8); // drop the divisor copy
+        emit_.neg(x64::Reg::RAX);
+        emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
         std::size_t skip_real = emit_.jmp_rel32_placeholder();
-        emit_.patch_jump(not_min_a);
-        emit_.patch_jump(not_min_b);
-        emit_.add_imm(x64::Reg::RSP, 8); // drop the shifted copy
         emit_.patch_jump(do_idiv);
         emit_.cqo();
         emit_.idiv_mem(x64::Reg::RSP, 0);
         emit_.add_imm(x64::Reg::RSP, 8);
         emit_.patch_jump(skip_real);
+        emit_.patch_jump(after_zero);
     }
 
 
@@ -11020,7 +11437,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     emit_.mov(x64::Reg::RAX, dst);
                     if (is_unsigned) {
                         emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
-                        emit_.div(rhs);
+                        emit_safe_udiv(rhs);
                     } else {
                         if (rhs == x64::Reg::RDX) {
                         // cqo in emit_safe_idiv clobbers RDX; move the divisor somewhere
@@ -11037,7 +11454,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 }
                 if (is_unsigned) {
                     emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
-                    emit_.div(rhs);
+                    emit_safe_udiv(rhs);
                 } else {
                     if (rhs == x64::Reg::RDX) {
                         // cqo in emit_safe_idiv clobbers RDX; move the divisor somewhere
@@ -11055,7 +11472,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     emit_.mov(x64::Reg::RAX, dst);
                     if (is_unsigned) {
                         emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
-                        emit_.div(rhs);
+                        emit_safe_udiv(rhs);
                     } else {
                         if (rhs == x64::Reg::RDX) {
                         // cqo in emit_safe_idiv clobbers RDX; move the divisor somewhere
@@ -11072,7 +11489,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 }
                 if (is_unsigned) {
                     emit_.xor_32(x64::Reg::RDX, x64::Reg::RDX);
-                    emit_.div(rhs);
+                    emit_safe_udiv(rhs);
                 } else {
                     if (rhs == x64::Reg::RDX) {
                         // cqo in emit_safe_idiv clobbers RDX; move the divisor somewhere
@@ -11318,41 +11735,43 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
         if (field.base->is<ast::IdentExpr>()) {
             const auto& ident = field.base->as<ast::IdentExpr>();
-            Symbol* sym = current_scope_->lookup(ident.name);
-            if (sym) {
-                auto sn = get_struct_name(sym->type);
+            // the inline alias wins over a same-named caller local: inside an
+            // inlined body the alias IS the function's parameter
+            const ast::Expr* inline_expr = current_scope_ ? current_scope_->lookup_inline(ident.name) : nullptr;
+            if (inline_expr) {
+                // the alias holds the parameter's value: materialize it into dst and
+                // load the field from there (base_sym stays null, so the tail's
+                // computed-pointer path is used)
+                if (!generate_pure_expr_into(*inline_expr, dst)) {
+                    return false;
+                }
+                auto struct_type = infer_expr_type(*field.base);
+                if (!struct_type) {
+                    return false;
+                }
+                auto sn = get_struct_name(*struct_type);
                 if (!sn) {
-                    error(std::format("variable '{}' is not a struct type", ident.name));
                     return false;
                 }
-                base_sym = sym;
                 struct_name = *sn;
-                if (!generate_bound_ident_into(ident, dst)) {
-                    return false;
-                }
-            } else if (current_scope_) {
-                if (const ast::Expr* inline_expr = current_scope_->lookup_inline(ident.name)) {
-                    auto inline_type = infer_expr_type(*inline_expr);
-                    if (!inline_type) {
-                        error_undefined_name("variable", ident.name, collect_value_name_candidates());
-                        return false;
-                    }
-                    auto sn = get_struct_name(*inline_type);
+                base_sym = nullptr;
+            } else {
+                Symbol* sym = current_scope_->lookup(ident.name);
+                if (sym) {
+                    auto sn = get_struct_name(sym->type);
                     if (!sn) {
                         error(std::format("variable '{}' is not a struct type", ident.name));
                         return false;
                     }
+                    base_sym = sym;
                     struct_name = *sn;
-                    if (!generate_pure_expr_into(*inline_expr, dst)) {
+                    if (!generate_bound_ident_into(ident, dst)) {
                         return false;
                     }
                 } else {
                     error_undefined_name("variable", ident.name, collect_value_name_candidates());
                     return false;
                 }
-            } else {
-                error_undefined_name("variable", ident.name, collect_value_name_candidates());
-                return false;
             }
         } else if (field.base->is<ast::FieldExpr>()) {
             auto base_type = resolve_field_type(field.base->as<ast::FieldExpr>());
@@ -11409,11 +11828,23 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 return true;
             }
             emit_.mov_load(dst, x64::Reg::RBP, base_sym->stack_offset);
+            // a null struct pointer must not fault: leave the result as 0
+            emit_.test(dst, dst);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            std::size_t done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
             emit_.mov_load(dst, dst, offset);
+            emit_.patch_jump(done);
             return true;
         }
 
+        // same guard for the computed base pointer already in dst
+        emit_.test(dst, dst);
+        std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+        std::size_t done = emit_.jmp_rel32_placeholder();
+        emit_.patch_jump(non_null);
         emit_.mov_load(dst, dst, offset);
+        emit_.patch_jump(done);
         return true;
     }
 
@@ -11503,6 +11934,8 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
         if (auto* ident = std::get_if<ast::IdentExpr>(&expr.kind)) {
             if (current_scope_) {
+                // the inline alias wins: an inlined function's parameter names are
+                // registered as aliases and must shadow caller locals of the same name
                 if (const ast::Expr* inline_expr = current_scope_->lookup_inline(ident->name)) {
                     if (generate_pure_expr_into(*inline_expr, dst)) {
                         return true;
@@ -11536,6 +11969,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         }
 
         if (auto* bin = std::get_if<ast::BinaryExpr>(&expr.kind)) {
+            if (!validate_binary_operands(*bin)) {
+                return false;
+            }
             std::int64_t rhs_imm = 0;
             if (try_get_i64_immediate(*bin->rhs, rhs_imm) && supports_binary_rhs_imm(bin->op, rhs_imm)) {
                 // fast path: lhs is a bound ident — use 3-operand imul / lea-add to avoid
@@ -11546,13 +11982,14 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     while (cur && cur->is<ast::IdentExpr>()) {
                         if (!current_scope_) return std::nullopt;
                         const auto& name = cur->as<ast::IdentExpr>().name;
-                        if (Symbol* sym = current_scope_->lookup(name)) {
-                            if (stack_struct_locals_.contains(sym)) return std::nullopt;
-                            return lookup_bound_reg(sym);
-                        }
+                        // the inline alias wins: it is the inlined function's parameter
                         if (const ast::Expr* inlined = current_scope_->lookup_inline(name)) {
                             cur = inlined;
                             continue;
+                        }
+                        if (Symbol* sym = current_scope_->lookup(name)) {
+                            if (stack_struct_locals_.contains(sym)) return std::nullopt;
+                            return lookup_bound_reg(sym);
                         }
                         return std::nullopt;
                     }
@@ -11581,13 +12018,14 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 while (cur && cur->is<ast::IdentExpr>()) {
                     const auto& name = cur->as<ast::IdentExpr>().name;
                     if (!current_scope_) return std::nullopt;
-                    if (Symbol* sym = current_scope_->lookup(name)) {
-                        if (stack_struct_locals_.contains(sym)) return std::nullopt;
-                        return lookup_bound_reg(sym);
-                    }
+                    // the inline alias wins: it is the inlined function's parameter
                     if (const ast::Expr* inlined = current_scope_->lookup_inline(name)) {
                         cur = inlined;
                         continue;
+                    }
+                    if (Symbol* sym = current_scope_->lookup(name)) {
+                        if (stack_struct_locals_.contains(sym)) return std::nullopt;
+                        return lookup_bound_reg(sym);
                     }
                     return std::nullopt;
                 }
@@ -11651,6 +12089,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
     [[nodiscard]] bool generate_ident_into(const ast::IdentExpr& ident, x64::Reg dst) {
         if (current_scope_) {
+            // the inline alias is checked first: when a single-use function is
+            // inlined, its parameter names are registered as aliases, and inside the
+            // inlined body they must shadow any caller local of the same name.
             if (const ast::Expr* inline_expr = current_scope_->lookup_inline(ident.name)) {
                 if (can_generate_pure_expr(*inline_expr) && generate_pure_expr_into(*inline_expr, dst)) {
                     return true;
@@ -11679,6 +12120,17 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             [&](const ast::IndexExpr& e)   { return generate_index(e); },
             [&](const ast::FieldExpr& e)   { return generate_field(e); },
             [&](const ast::CastExpr& e)    {
+                // a cast to a name that resolves to no known type silently produced a
+                // zero-payload type and compiled to garbage; reject it.
+                if (auto* named = std::get_if<std::string>(&e.target_type.kind)) {
+                    std::string resolved = resolve_type_name(*named);
+                    bool known = structs_.contains(resolved) || enums_.contains(resolved) ||
+                                 named_type_aliases_.contains(resolved);
+                    if (!known) {
+                        error_unknown_type("cast target type", *named);
+                        return false;
+                    }
+                }
                 if (!generate_expr(*e.expr)) {
                     return false;
                 }
@@ -11747,9 +12199,11 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
 
         if (field.base->is<ast::IdentExpr>()) {
             const std::string& var_name = field.base->as<ast::IdentExpr>().name;
-            Symbol* sym = current_scope_->lookup(var_name);
+            // the inline alias wins over a same-named caller local: inside an
+            // inlined body the alias IS the function's parameter
+            const ast::Expr* inlined = current_scope_ ? current_scope_->lookup_inline(var_name) : nullptr;
+            Symbol* sym = inlined ? nullptr : current_scope_->lookup(var_name);
             if (!sym) {
-                const ast::Expr* inlined = current_scope_ ? current_scope_->lookup_inline(var_name) : nullptr;
                 if (!inlined) {
                     error_undefined_name("variable", var_name, collect_value_name_candidates());
                     return false;
@@ -11849,14 +12303,52 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 return true;
             }
             emit_.mov_load(x64::Reg::RAX, x64::Reg::RBP, base_sym->stack_offset);
+            // a null struct pointer must not fault: yield 0 instead of dereferencing
+            emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            std::size_t done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
             emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, offset);
+            emit_.patch_jump(done);
             return true;
         }
 
         if (base_in_rax) {
+            // same guard for a computed base pointer in RAX
+            emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            std::size_t done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
             emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, offset);
+            emit_.patch_jump(done);
         }
 
+        return true;
+    }
+
+    // a struct literal must name every declared field exactly once. HeapAlloc leaves
+    // omitted fields holding garbage, and a duplicate writes the same slot twice, so
+    // either is a silently wrong value rather than a diagnostic.
+    [[nodiscard]] bool check_struct_literal_fields(const ast::StructExpr& lit,
+                                                   const StructInfo& info) {
+        std::unordered_set<std::string> provided;
+        for (const auto& [field_name, _v] : lit.fields) {
+            if (!info.get_field_offset(field_name)) {
+                error(std::format("struct '{}' has no field '{}'", lit.name, field_name));
+                return false;
+            }
+            if (!provided.insert(field_name).second) {
+                error(std::format("struct literal for '{}' sets field '{}' more than once",
+                                  lit.name, field_name));
+                return false;
+            }
+        }
+        for (const auto& [fname, _t] : info.fields) {
+            if (!provided.contains(fname)) {
+                error(std::format("struct literal for '{}' is missing field '{}'", lit.name, fname));
+                return false;
+            }
+        }
         return true;
     }
 
@@ -11870,6 +12362,13 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         }
         
         const StructInfo& info = it->second;
+
+        // every declared field must appear exactly once: HeapAlloc leaves any
+        // omitted field holding garbage, so a partial literal is a silently wrong
+        // value, not a default-initialised one.
+        if (!check_struct_literal_fields(lit, info)) {
+            return false;
+        }
         
         // Allocate memory for struct
         std::size_t size = info.total_size > 0 ? info.total_size : 8;  // min 8 bytes
@@ -12112,6 +12611,72 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         return true;
     }
 
+    // compile-time bounds check for a literal index into a known-size array/string.
+    // returns false (after raising a hard error) when the index is provably out of
+    // range, so a guaranteed fault becomes a build failure instead.
+    [[nodiscard]] bool check_literal_index_bounds(const ast::IndexExpr& idx, const Type& base_type) {
+        // an index whose type is statically a float or string is never valid: the
+        // element address would be computed from the raw bits.
+        if (idx.index) {
+            auto index_type = infer_expr_type(*idx.index);
+            if (index_type) {
+                auto resolved = canonicalize_type(*index_type);
+                const Type& t = resolved ? *resolved : *index_type;
+                if (t.is_float() || is_str_type(t) || t.is_void()) {
+                    error(std::format("index expression has type '{}'; an integer index is required",
+                                      type_display_name(t)));
+                    return false;
+                }
+            }
+        }
+
+        std::int64_t index = 0;
+        if (!try_get_i64_immediate(*idx.index, index)) {
+            return true;  // not a literal, cannot prove anything
+        }
+
+        std::optional<std::size_t> known_len;
+        if (auto* arr = std::get_if<ArrayType>(&base_type.kind); arr && arr->size) {
+            known_len = *arr->size;
+        } else if (idx.base->is<ast::IdentExpr>()) {
+            const std::string& name = idx.base->as<ast::IdentExpr>().name;
+            Symbol* sym = current_scope_->lookup(name);
+            if (sym && sym->array_len) {
+                known_len = sym->array_len;
+            } else if (!sym) {
+                // a single-use immutable binding is inlined rather than kept as a
+                // symbol; resolve it so its length is still known
+                const ast::Expr* inlined = current_scope_->lookup_inline(name);
+                if (inlined) {
+                    if (auto* lit = std::get_if<ast::LiteralExpr>(&inlined->kind)) {
+                        if (auto* s = std::get_if<std::string>(&lit->value)) {
+                            known_len = s->size();
+                        }
+                    } else if (auto* arr_lit = std::get_if<ast::ArrayExpr>(&inlined->kind)) {
+                        known_len = arr_lit->elements.size();
+                    }
+                }
+            }
+        } else if (idx.base->is<ast::ArrayExpr>()) {
+            known_len = idx.base->as<ast::ArrayExpr>().elements.size();
+        } else if (idx.base->is<ast::LiteralExpr>()) {
+            const auto& lit = idx.base->as<ast::LiteralExpr>();
+            if (auto* s = std::get_if<std::string>(&lit.value)) {
+                known_len = s->size();
+            }
+        }
+        if (!known_len) {
+            return true;
+        }
+
+        if (index < 0 || static_cast<std::uint64_t>(index) >= *known_len) {
+            error(std::format("index {} is out of bounds for array of length {}",
+                              index, *known_len));
+            return false;
+        }
+        return true;
+    }
+
     [[nodiscard]] bool generate_index(const ast::IndexExpr& idx) {
         auto base_type = infer_expr_type(*idx.base);
         std::optional<Type> elem_type;
@@ -12120,6 +12685,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         if (base_type) {
             auto resolved = canonicalize_type(*base_type);
             const Type& final_base = resolved ? *resolved : *base_type;
+            if (!check_literal_index_bounds(idx, final_base)) {
+                return false;
+            }
             if (auto* ptr = std::get_if<PointerType>(&final_base.kind)) {
                 elem_type = ptr->pointee->clone();
                 stride = typed_element_stride(*elem_type);
@@ -12132,6 +12700,21 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 elem_type = Type::make_primitive(PrimitiveType::U8);
                 stride = 1;
                 is_typed_raw = true;
+            } else {
+                // indexing a float / void / bool: never a pointer or a handle, so
+                // this can only misbehave. (plain integers are left permissive:
+                // builtins like array_new return a raw i64 handle that IS indexable)
+                if (final_base.is_float() || final_base.is_void() ||
+                    std::holds_alternative<StructType>(final_base.kind)) {
+                    error(std::format("cannot index a value of type '{}'; an array, pointer, or string is required",
+                                      type_display_name(final_base)));
+                    return false;
+                }
+                if (auto* prim = std::get_if<PrimitiveType>(&final_base.kind);
+                    prim && *prim == PrimitiveType::Bool) {
+                    error("cannot index a bool value; an array, pointer, or string is required");
+                    return false;
+                }
             }
         }
 
@@ -12141,15 +12724,64 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         if (!generate_expr(*idx.index)) return false;
 
         emit_.pop(x64::Reg::R11);
+        // runtime bounds guard for a computed index into a known heap array: the
+        // length lives at [base-16] in native-image output. an out-of-range index
+        // reads 0 instead of faulting.
+        bool heap_guarded = false;
+        std::size_t heap_null_jump = 0;
+        std::size_t heap_oob_jump = 0;
+        if (is_native_image_output() && idx.base->is<ast::IdentExpr>()) {
+            Symbol* base_sym = current_scope_->lookup(idx.base->as<ast::IdentExpr>().name);
+            if (base_sym && base_sym->is_heap_array) {
+                // guard the null base first: [base-16] would fault on a null ptr
+                emit_.test(x64::Reg::R11, x64::Reg::R11);
+                std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
+                heap_null_jump = emit_.jmp_rel32_placeholder();
+                emit_.patch_jump(non_null);
+                // unsigned compare catches both negative and too-large indices,
+                // length lives at [base-16] in native-image output
+                emit_.cmp_mem(x64::Reg::RAX, x64::Reg::R11, -16);
+                std::size_t in_bounds = emit_.jcc_rel32(x64::Emitter::CC_B);
+                emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
+                heap_oob_jump = emit_.jmp_rel32_placeholder();
+                emit_.patch_jump(in_bounds);
+                heap_guarded = true;
+            }
+        }
+        // guard the typed path: a null base must not fault, yield a zero
+        // element instead (base in R11, index in RAX after the pop)
+        bool guarded = false;
+        std::size_t guarded_done = 0;
+        if (is_typed_raw && elem_type) {
+            emit_.test(x64::Reg::R11, x64::Reg::R11);
+            std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+            emit_.xor_(x64::Reg::RAX, x64::Reg::RAX);
+            guarded_done = emit_.jmp_rel32_placeholder();
+            emit_.patch_jump(non_null);
+            guarded = true;
+        }
         emit_.lea_scaled(x64::Reg::RAX, x64::Reg::R11, x64::Reg::RAX, stride);
         if (!is_typed_raw && !is_native_image_output()) {
             emit_.add_smart(x64::Reg::RAX, 8);
         }
 
         if (is_typed_raw && elem_type) {
-            return emit_load_typed_from_address_in_rax(*elem_type);
+            if (!emit_load_typed_from_address_in_rax(*elem_type)) return false;
+            if (guarded) {
+                emit_.patch_jump(guarded_done);
+            }
+            if (heap_guarded) {
+                emit_.patch_jump(heap_null_jump);
+                emit_.patch_jump(heap_oob_jump);
+            }
+            return true;
         }
         emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, 0);
+        if (heap_guarded) {
+            emit_.patch_jump(heap_null_jump);
+            emit_.patch_jump(heap_oob_jump);
+        }
         return true;
     }
 
@@ -12261,6 +12893,71 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         return generate_ident_into(ident, x64::Reg::RAX);
     }
 
+    // Reject str/char operands for operators that only make sense on numbers.
+    // Without this the operands decay to raw pointers and silently miscompile
+    // (str + str builds an interior pointer, str < 0 compares a pointer, etc).
+    [[nodiscard]] bool validate_binary_operands(const ast::BinaryExpr& bin) {
+        using Op = ast::BinaryExpr::Op;
+        switch (bin.op) {
+            case Op::Add: case Op::Sub: case Op::Mul: case Op::Div: case Op::Mod:
+            case Op::BitAnd: case Op::BitOr: case Op::BitXor:
+            case Op::Shl: case Op::Shr:
+            case Op::Lt: case Op::Gt: case Op::Le: case Op::Ge:
+                break;
+            default:
+                return true; // comparisons, logical, and assignment ops are fine
+        }
+        auto string_like = [](const std::optional<Type>& t) {
+            if (!t) return false;
+            if (auto* p = std::get_if<PrimitiveType>(&t->kind)) {
+                return *p == PrimitiveType::Str || *p == PrimitiveType::Char;
+            }
+            return false;
+        };
+        // only flag when we can actually see a str/char operand; unknown types stay permissive
+        if (string_like(infer_expr_type(*bin.lhs)) || string_like(infer_expr_type(*bin.rhs))) {
+            error("operator does not accept str/char operands; use string helpers "
+                  "(string_equals, string_append, text_join, mem.read8) instead");
+            return false;
+        }
+
+        // division / modulo by a literal zero always faults at runtime (#DE).
+        if (bin.op == Op::Div || bin.op == Op::Mod) {
+            std::int64_t rhs_imm = 0;
+            if (try_get_i64_immediate(*bin.rhs, rhs_imm) && rhs_imm == 0) {
+                error(bin.op == Op::Div
+                          ? "division by zero: the divisor is a literal 0"
+                          : "modulo by zero: the divisor is a literal 0");
+                return false;
+            }
+            // integer % is meaningless on a float operand: the remainder is defined
+            // only for integers, and codegen would emit a raw integer op on the bits.
+            if (bin.op == Op::Mod) {
+                auto lhs_t = infer_expr_type(*bin.lhs);
+                if (lhs_t) {
+                    if (auto* prim = std::get_if<PrimitiveType>(&lhs_t->kind);
+                        prim && (*prim == PrimitiveType::F32 || *prim == PrimitiveType::F64)) {
+                        error("modulo '%' requires an integer operand, not a float");
+                        return false;
+                    }
+                }
+            }
+        }
+
+        // shift by a negative literal count is a sign-extension bug: the CPU masks
+        // the count to 6 bits, so `1 << -1` is `1 << 63`, which is never intended.
+        // (a count >= 64 is deliberately left alone: tests/stress_codegen/test03
+        // asserts the masked behaviour is defined and supported)
+        if (bin.op == Op::Shl || bin.op == Op::Shr) {
+            std::int64_t shift_count = 0;
+            if (try_get_i64_immediate(*bin.rhs, shift_count) && shift_count < 0) {
+                error(std::format("shift count {} is negative", shift_count));
+                return false;
+            }
+        }
+        return true;
+    }
+
     [[nodiscard]] bool generate_binary(const ast::BinaryExpr& bin) {
         using Op = ast::BinaryExpr::Op;
 
@@ -12289,6 +12986,13 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             return std::nullopt;
         };
         BinaryOpTypeGuard type_guard(this, pick_operand_type());
+
+        // reject string/char operands for arithmetic, bitwise and ordering ops.
+        // these currently fall through to raw pointer arithmetic and miscompile
+        // (str + str, str < 0, int + str) instead of being diagnosed.
+        if (!validate_binary_operands(bin)) {
+            return false;
+        }
 
         // try constant folding - if both operands are literals, compute at compile time
         if (auto* lhs_lit = std::get_if<ast::LiteralExpr>(&bin.lhs->kind)) {
@@ -12449,13 +13153,14 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 while (cur && cur->is<ast::IdentExpr>()) {
                     if (!current_scope_) return std::nullopt;
                     const auto& name = cur->as<ast::IdentExpr>().name;
-                    if (Symbol* sym = current_scope_->lookup(name)) {
-                        if (stack_struct_locals_.contains(sym)) return std::nullopt;
-                        return lookup_bound_reg(sym);
-                    }
+                    // the inline alias wins: it is the inlined function's parameter
                     if (const ast::Expr* inlined = current_scope_->lookup_inline(name)) {
                         cur = inlined;
                         continue;
+                    }
+                    if (Symbol* sym = current_scope_->lookup(name)) {
+                        if (stack_struct_locals_.contains(sym)) return std::nullopt;
+                        return lookup_bound_reg(sym);
                     }
                     return std::nullopt;
                 }
@@ -12687,11 +13392,23 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 } else if (stack_struct_locals_.contains(base_sym)) {
                     emit_.mov_store(x64::Reg::RBP, base_sym->stack_offset + offset, *value_reg);
                 } else {
+                    // a null struct pointer must not fault: skip the store
                     emit_.mov_load(x64::Reg::RAX, x64::Reg::RBP, base_sym->stack_offset);
+                    emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+                    std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                    std::size_t done = emit_.jmp_rel32_placeholder();
+                    emit_.patch_jump(non_null);
                     emit_.mov_store(x64::Reg::RAX, offset, *value_reg);
+                    emit_.patch_jump(done);
                 }
             } else {
+                // same guard for a computed base pointer in RAX
+                emit_.test(x64::Reg::RAX, x64::Reg::RAX);
+                std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                std::size_t done = emit_.jmp_rel32_placeholder();
+                emit_.patch_jump(non_null);
                 emit_.mov_store(x64::Reg::RAX, offset, *value_reg);
+                emit_.patch_jump(done);
             }
             
             return true;
@@ -12727,6 +13444,9 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                     error("cannot assign into immutable string index");
                     return false;
                 }
+                if (!check_literal_index_bounds(idx, final_base)) {
+                    return false;
+                }
                 if (auto* ptr = std::get_if<PointerType>(&final_base.kind)) {
                     elem_type = ptr->pointee->clone();
                     stride = typed_element_stride(*elem_type);
@@ -12743,21 +13463,70 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             emit_.push(x64::Reg::RAX);
             if (!generate_expr(*idx.index)) return false;
             emit_.pop(x64::Reg::R11);
+            bool guarded = false;
+            std::size_t guarded_done = 0;
+            bool heap_guarded = false;
+            std::size_t heap_null_jump = 0;
+            std::size_t heap_oob_jump = 0;
+            if (is_native_image_output() && idx.base->is<ast::IdentExpr>()) {
+                Symbol* base_sym = current_scope_->lookup(idx.base->as<ast::IdentExpr>().name);
+                if (base_sym && base_sym->is_heap_array) {
+                    // passive store: null base or an out-of-range index drops the
+                    // saved value and skips the write instead of faulting.
+                    // length lives at [base-16] in native-image output.
+                    emit_.test(x64::Reg::R11, x64::Reg::R11);
+                    std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                    emit_.add_imm(x64::Reg::RSP, 8);
+                    heap_null_jump = emit_.jmp_rel32_placeholder();
+                    emit_.patch_jump(non_null);
+                    emit_.cmp_mem(x64::Reg::RAX, x64::Reg::R11, -16);
+                    std::size_t in_bounds = emit_.jcc_rel32(x64::Emitter::CC_B);
+                    emit_.add_imm(x64::Reg::RSP, 8);
+                    heap_oob_jump = emit_.jmp_rel32_placeholder();
+                    emit_.patch_jump(in_bounds);
+                    heap_guarded = true;
+                }
+            }
+            if (is_typed_raw && elem_type) {
+                // null base must not fault: ignore the store entirely
+                emit_.test(x64::Reg::R11, x64::Reg::R11);
+                std::size_t non_null = emit_.jcc_rel32(x64::Emitter::CC_NE);
+                // drop the saved value and exit
+                emit_.add_imm(x64::Reg::RSP, 8);
+                guarded_done = emit_.jmp_rel32_placeholder();
+                emit_.patch_jump(non_null);
+                guarded = true;
+            }
             emit_.lea_scaled(x64::Reg::RAX, x64::Reg::R11, x64::Reg::RAX, stride);
             if (!is_typed_raw && !is_native_image_output()) {
                 emit_.add_smart(x64::Reg::RAX, 8); // host fallback arrays store length at arr[0]
             }
             emit_.mov(x64::Reg::R11, x64::Reg::RAX);
             emit_.pop(x64::Reg::RAX);
-            if (is_typed_raw && elem_type && stride < 8) {
-                bool save_rcx = reg_is_bound(x64::Reg::RCX);
-                if (save_rcx) emit_.push(x64::Reg::RCX);
-                emit_.mov(x64::Reg::RCX, x64::Reg::R11);
-                bool ok = emit_store_typed_to_address_in_rcx(*elem_type);
-                if (save_rcx) emit_.pop(x64::Reg::RCX);
-                return ok;
+            if (is_typed_raw && elem_type) {
+                if (stride < 8) {
+                    bool save_rcx = reg_is_bound(x64::Reg::RCX);
+                    if (save_rcx) emit_.push(x64::Reg::RCX);
+                    emit_.mov(x64::Reg::RCX, x64::Reg::R11);
+                    if (!emit_store_typed_to_address_in_rcx(*elem_type)) return false;
+                    if (save_rcx) emit_.pop(x64::Reg::RCX);
+                } else {
+                    emit_.mov_store(x64::Reg::R11, 0, x64::Reg::RAX);
+                }
+                if (guarded) {
+                    emit_.patch_jump(guarded_done);
+                }
+                if (heap_guarded) {
+                    emit_.patch_jump(heap_null_jump);
+                    emit_.patch_jump(heap_oob_jump);
+                }
+                return true;
             }
             emit_.mov_store(x64::Reg::R11, 0, x64::Reg::RAX);
+            if (heap_guarded) {
+                emit_.patch_jump(heap_null_jump);
+                emit_.patch_jump(heap_oob_jump);
+            }
             return true;
         }
 
@@ -13131,9 +13900,22 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
             case Op::BitNot:
                 emit_.not_(x64::Reg::RAX);
                 break;
-            case Op::Deref:
+            case Op::Deref: {
+                // refuse to dereference a value that is statically an integer: this is
+                // always a bug (the integer is treated as an address) and would fault.
+                auto operand_type = infer_expr_type(*un.operand);
+                if (operand_type) {
+                    auto resolved = canonicalize_type(*operand_type);
+                    const Type& t = resolved ? *resolved : *operand_type;
+                    if (t.is_integer() || t.is_float() || t.is_void()) {
+                        error(std::format("cannot dereference a value of type '{}'; a pointer is required",
+                                          type_display_name(t)));
+                        return false;
+                    }
+                }
                 emit_.mov_load(x64::Reg::RAX, x64::Reg::RAX, 0);
                 break;
+            }
             case Op::AddrOf:
             case Op::AddrOfMut:
                 // For identifiers, load the address
@@ -13267,6 +14049,30 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         if (it == functions_.end()) {
             error_undefined_name("function", resolved_target, collect_function_name_candidates());
             return false;
+        }
+
+        // warn when a string literal is passed to a parameter the callee frees:
+        // the literal lives in the PE image, not the heap, so the eventual
+        // HeapFree corrupts the heap (Windows STATUS_HEAP_CORRUPTION).
+        if (it->second.decl && it->second.decl->has_body()) {
+            auto owned = callee_owned_params(resolved_target);
+            for (std::size_t i = 0; i < call.args.size() && i < it->second.param_types.size(); ++i) {
+                if (!expr_is_string_literal(*call.args[i])) {
+                    continue;
+                }
+                const auto& ptype = it->second.param_types[i];
+                auto* prim = std::get_if<PrimitiveType>(&ptype.kind);
+                if (!prim || (*prim != PrimitiveType::Str && *prim != PrimitiveType::Ptr)) {
+                    continue;
+                }
+                if (std::find(owned.begin(), owned.end(), it->second.decl->params[i].name) != owned.end()) {
+                    warn(std::format(
+                        "passing a string literal to '{}' parameter '{}', which the function frees; "
+                        "the literal is not heap-allocated and freeing it corrupts the heap "
+                        "(clone it with string_substring first)",
+                        resolved_target, it->second.decl->params[i].name));
+                }
+            }
         }
 
         if (should_inline_direct_call(call, it->second)) {
@@ -13739,6 +14545,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         }
 
         std::size_t done = emit_.buffer().pos();
+        bool any_patched = false;
         for (std::size_t patch : return_patches) {
             auto rel = static_cast<std::int32_t>(done) - static_cast<std::int32_t>(patch + 4);
             if (rel == 0 && patch > 0) {
@@ -13751,6 +14558,10 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
                 continue;
             }
             emit_.buffer().patch32(patch, static_cast<std::uint32_t>(rel));
+            any_patched = true;
+        }
+        if (any_patched) {
+            emit_.note_jump_target(done);
         }
 
         cleanup_inline_scope();
@@ -15705,6 +16516,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t loop_rel = static_cast<std::int32_t>(
             loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(loop_rel);
+        emit_.note_jump_target(loop_top);
 
         // not_equal: return 0
         emit_.patch_jump(jne_patch);
@@ -15758,6 +16570,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t loop_rel = static_cast<std::int32_t>(
             loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(loop_rel);
+        emit_.note_jump_target(loop_top);
 
         emit_.patch_jump(mismatch);
         std::size_t done = emit_.jmp_rel32_placeholder();
@@ -15955,6 +16768,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t loop_rel = static_cast<std::int32_t>(
             loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(loop_rel);
+        emit_.note_jump_target(loop_top);
 
         emit_.patch_jump(invalid);
         emit_.patch_jump(invalid_after_cmp);
@@ -16192,6 +17006,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t loop_rel = static_cast<std::int32_t>(
             loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(loop_rel);
+        emit_.note_jump_target(loop_top);
 
         emit_.patch_jump(loop_done);
         emit_.mov_load(x64::Reg::RCX, x64::Reg::RSP, 56);
@@ -18712,6 +19527,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t spawn_loop_rel = static_cast<std::int32_t>(
             spawn_loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(spawn_loop_rel);
+        emit_.note_jump_target(spawn_loop_top);
         emit_.patch_jump(spawn_loop_exit);
     }
 
@@ -18750,6 +19566,7 @@ emit_.vmovdqu32_zmm_load(*zmm, x64::Reg::R10);
         std::int32_t close_rel = static_cast<std::int32_t>(
             close_loop_top - emit_.buffer().pos() - 5);
         emit_.jmp_rel32(close_rel);
+        emit_.note_jump_target(close_loop_top);
         emit_.patch_jump(close_loop_exit);
     }
 

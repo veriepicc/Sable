@@ -1,0 +1,10 @@
+// a partial struct literal leaves the omitted field holding heap garbage
+struct Pair {
+    x: int,
+    y: int
+}
+
+function int main() {
+    let p = Pair { x: 1 }
+    return p.x
+}

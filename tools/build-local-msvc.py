@@ -61,6 +61,7 @@ MODULES = [
     ("types", "src/types.ixx"),
     ("errors", "src/errors.ixx"),
     ("ast", "src/ast.ixx"),
+    ("warnings", "src/warnings.ixx"),
     ("lexer", "src/lexer.ixx"),
     ("parser", "src/parser.ixx"),
     ("x64", "src/x64.ixx"),

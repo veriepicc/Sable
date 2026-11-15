@@ -1,0 +1,8 @@
+// a parameter name used twice: the second silently shadows the first
+function int twice(int a, int a) {
+    return a
+}
+
+function int main() {
+    return twice(1, 2)
+}

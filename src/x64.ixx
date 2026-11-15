@@ -400,6 +400,12 @@ public:
         buf_.emit8(modrm(0b11, Reg(EXT_DIV), src));
     }
 
+    void div_mem(Reg base, std::int32_t offset) {
+        buf_.emit8(rex(true, Reg::RAX, base));
+        buf_.emit8(0xF7);
+        emit_mem_operand(Reg(EXT_DIV), base, offset);
+    }
+
     // cqo - sign-extend RAX into RDX:RAX
     void cqo() {
         buf_.emit8(0x48);
@@ -829,18 +835,31 @@ public:
         std::int32_t offset = static_cast<std::int32_t>(target - buf_.pos() - 5);
         buf_.emit8(0xE9);
         buf_.emit32(static_cast<std::uint32_t>(offset));
+        note_jump_target(target);
     }
-    
+
     void jcc_rel32_to(std::uint8_t cc, std::size_t target) {
         std::int32_t offset = static_cast<std::int32_t>(target - buf_.pos() - 6);
         buf_.emit8(0x0F);
         buf_.emit8(0x80 + cc);
         buf_.emit32(static_cast<std::uint32_t>(offset));
+        note_jump_target(target);
     }
+
+    // record that control flow can land on `offset`. the peephole pass must never
+    // delete or rewrite an instruction reachable by a branch, so it consults this.
+    void note_jump_target(std::size_t offset) { jump_targets_.insert(offset); }
+    [[nodiscard]] const std::unordered_set<std::size_t>& jump_targets() const {
+        return jump_targets_;
+    }
+    void clear_jump_targets() { jump_targets_.clear(); }
 
     void patch_jump(std::size_t jump_pos) {
         std::int32_t rel = static_cast<std::int32_t>(buf_.pos() - jump_pos - 4);
         buf_.patch32(jump_pos, static_cast<std::uint32_t>(rel));
+        // both the 5-byte `jmp rel32` and the 6-byte `jcc rel32` place their rel32
+        // field so that jump_pos + 4 is the address just past the instruction.
+        note_jump_target(static_cast<std::size_t>(static_cast<std::int64_t>(jump_pos) + 4 + rel));
     }
     
     void mov_imm(Reg dst, std::int32_t imm) {
@@ -2600,6 +2619,8 @@ buf_.emit8(0x6F);
 private:
     CodeBuffer buf_;
     int peephole_eliminated_ = 0;
+    // byte offsets that a branch can jump to; the peephole never rewrites these
+    std::unordered_set<std::size_t> jump_targets_;
 };
 
 // EXECUTABLE MEMORY (Windows)

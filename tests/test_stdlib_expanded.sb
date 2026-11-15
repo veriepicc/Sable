@@ -54,7 +54,7 @@ function int main() {
     }
 
     let ext = path_ext("mods/ui/clickgui.sb")
-    if string_equals(ext, "op") == 0 {
+    if string_equals(ext, "sb") == 0 {
         return 10
     }
 
