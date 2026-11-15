@@ -1,0 +1,169 @@
+import hash
+
+// correctness of stdlib/hash.sb against known reference values.
+// reference values computed independently (python zlib / manual FNV):
+//   fnv1a64("hello") = 11831194018420276491 (as i64: -6615550055289275125)
+//   crc32("hello")   = 907060870
+//   djb2("hello")    = 210714636441
+//   adler32("hello") = 103547413
+//   sum bytes        = 532
+//   xor bytes        = 98
+
+function int test_fnv1a() {
+    let h = hash_fnv1a("hello")
+    if h != (0 - 6615550055289275125) {
+        print("FAIL fnv1a: ")
+        print_int(h)
+        return 1
+    }
+    // empty input -> offset basis, a defined non-zero value
+    if hash_fnv1a("") != 0xCBF29CE484222325 {
+        print("FAIL fnv1a empty\n")
+        return 2
+    }
+    // a null string must not fault
+    let null_str: str = 0 as str
+    if hash_fnv1a(null_str) != 0xCBF29CE484222325 {
+        print("FAIL fnv1a null\n")
+        return 3
+    }
+    // order matters
+    if hash_fnv1a("ab") == hash_fnv1a("ba") {
+        print("FAIL fnv1a order\n")
+        return 4
+    }
+    return 0
+}
+
+function int test_crc32() {
+    let c = hash_crc32("hello")
+    if c != 907060870 {
+        print("FAIL crc32: ")
+        print_int(c)
+        return 1
+    }
+    if hash_crc32("") != 0 {
+        print("FAIL crc32 empty\n")
+        return 2
+    }
+    // known crc32 of "123456789" is 0xCBF43926 = 3421780262
+    if hash_crc32("123456789") != 3421780262 {
+        print("FAIL crc32 check vector: ")
+        print_int(hash_crc32("123456789"))
+        return 3
+    }
+    return 0
+}
+
+function int test_djb2() {
+    let d = hash_djb2("hello")
+    if d != 210714636441 {
+        print("FAIL djb2: ")
+        print_int(d)
+        return 1
+    }
+    if hash_djb2("") != 5381 {
+        print("FAIL djb2 empty\n")
+        return 2
+    }
+    return 0
+}
+
+function int test_checksums() {
+    if checksum_sum_bytes("hello" as ptr, 5) != 532 {
+        print("FAIL sum\n")
+        return 1
+    }
+    if checksum_xor_bytes("hello" as ptr, 5) != 98 {
+        print("FAIL xor\n")
+        return 2
+    }
+    if checksum_adler32("hello" as ptr, 5) != 103547413 {
+        print("FAIL adler32\n")
+        return 3
+    }
+    // empty buffer yields the adler seed, not a fault
+    if checksum_adler32(0 as ptr, 0) != 1 {
+        print("FAIL adler32 empty\n")
+        return 4
+    }
+    return 0
+}
+
+function int test_mix_and_bucket() {
+    // the mixer must be a bijection-ish avalanche: distinct inputs stay distinct
+    // here, and identical inputs stay identical
+    if hash_mix_i64(0) != hash_mix_i64(0) {
+        print("FAIL mix determinism\n")
+        return 1
+    }
+    if hash_mix_i64(1) == hash_mix_i64(2) {
+        print("FAIL mix collision\n")
+        return 2
+    }
+    // bucket is always in range and never negative
+    var i = 0
+    while i < 1000 {
+        let b = hash_bucket(i, 16)
+        if b < 0 || b >= 16 {
+            print("FAIL bucket out of range: ")
+            print_int(b)
+            return 3
+        }
+        i++
+    }
+    // a non-positive bucket count must not divide by zero
+    if hash_bucket(42, 0) != 0 {
+        print("FAIL bucket zero\n")
+        return 4
+    }
+    if hash_bucket(42, 0 - 5) != 0 {
+        print("FAIL bucket negative\n")
+        return 5
+    }
+    // combine is order-sensitive
+    if hash_combine(1, 2) == hash_combine(2, 1) {
+        print("FAIL combine order\n")
+        return 6
+    }
+    return 0
+}
+
+function int test_i64_helper() {
+    // hashing the 8 zero bytes of an i64 is NOT the same as empty input: it folds
+    // eight zero bytes through the multiply, giving a fixed non-basis value.
+    if hash_fnv1a_i64(0) != (0 - 6284781860667377211) {
+        print("FAIL fnv1a_i64 zero: ")
+        print_int(hash_fnv1a_i64(0))
+        return 1
+    }
+    if hash_fnv1a_i64(1) == hash_fnv1a_i64(2) {
+        print("FAIL fnv1a_i64 collision\n")
+        return 2
+    }
+    if hash_to_u32(0x1FFFFFFFF) != 0xFFFFFFFF {
+        print("FAIL to_u32\n")
+        return 3
+    }
+    return 0
+}
+
+function int main() {
+    alloc_console()
+
+    let r1 = test_fnv1a()
+    if r1 != 0 { return 10 + r1 }
+    let r2 = test_crc32()
+    if r2 != 0 { return 20 + r2 }
+    let r3 = test_djb2()
+    if r3 != 0 { return 30 + r3 }
+    let r4 = test_checksums()
+    if r4 != 0 { return 40 + r4 }
+    let r5 = test_mix_and_bucket()
+    if r5 != 0 { return 50 + r5 }
+    let r6 = test_i64_helper()
+    if r6 != 0 { return 60 + r6 }
+
+    print("hash: all tests passed\n")
+    return 0
+}

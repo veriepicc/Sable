@@ -876,7 +876,9 @@
     "Name": "tests/stress_ffi/test20_double_indirect.sb",
     "File": "tests/stress_ffi/test20_double_indirect.sb",
     "ExpectedExit": 0,
-    "ExpectedRuntimeOutputContains": ["double indirect ok\n"]
+    "ExpectedRuntimeOutputContains": [
+      "double indirect ok\n"
+    ]
   },
   {
     "kind": "stress",
@@ -939,7 +941,9 @@
     "Name": "tests/stress_memory/positive/test_nested_struct_view.sb",
     "File": "tests/stress_memory/positive/test_nested_struct_view.sb",
     "ExpectedExit": 0,
-    "ExpectedRuntimeOutputContains": ["nested struct ok\n"]
+    "ExpectedRuntimeOutputContains": [
+      "nested struct ok\n"
+    ]
   },
   {
     "kind": "stress",
@@ -947,7 +951,10 @@
     "File": "tests/stress_memory/positive/test_null_ptr_deref.sb",
     "Healing": "auto",
     "ExpectedExit": 0,
-    "ExpectedRuntimeOutputContains": ["ACCESS_VIOLATION", "null read recovered\n"]
+    "ExpectedRuntimeOutputContains": [
+      "ACCESS_VIOLATION",
+      "null read recovered\n"
+    ]
   },
   {
     "kind": "stress",
@@ -960,7 +967,10 @@
     "File": "tests/stress_memory/positive/test_ptr_stored_in_view.sb",
     "Healing": "auto",
     "ExpectedExit": 0,
-    "ExpectedRuntimeOutputContains": ["ACCESS_VIOLATION", "view pointer read recovered\n"]
+    "ExpectedRuntimeOutputContains": [
+      "ACCESS_VIOLATION",
+      "view pointer read recovered\n"
+    ]
   },
   {
     "kind": "stress",
@@ -968,7 +978,10 @@
     "File": "tests/stress_memory/positive/test_ptr_wraparound.sb",
     "Healing": "auto",
     "ExpectedExit": 0,
-    "ExpectedRuntimeOutputContains": ["ACCESS_VIOLATION", "out of bounds write recovered\n"]
+    "ExpectedRuntimeOutputContains": [
+      "ACCESS_VIOLATION",
+      "out of bounds write recovered\n"
+    ]
   },
   {
     "kind": "stress",
@@ -1005,7 +1018,9 @@
     "Name": "tests/stress_concurrency/positive/await_then_free.sb",
     "File": "tests/stress_concurrency/positive/await_then_free.sb",
     "ExpectedExit": 0,
-    "ExpectedRuntimeOutputContains": ["consumed handle free ok"]
+    "ExpectedRuntimeOutputContains": [
+      "consumed handle free ok"
+    ]
   },
   {
     "kind": "stress",
@@ -1037,7 +1052,9 @@
     "Name": "tests/stress_concurrency/positive/double_await_real.sb",
     "File": "tests/stress_concurrency/positive/double_await_real.sb",
     "ExpectedExit": 0,
-    "ExpectedRuntimeOutputContains": ["consumed handle await ok"]
+    "ExpectedRuntimeOutputContains": [
+      "consumed handle await ok"
+    ]
   },
   {
     "kind": "stress",
@@ -1094,7 +1111,9 @@
     "Name": "tests/stress_concurrency/positive/reuse_await_handle.sb",
     "File": "tests/stress_concurrency/positive/reuse_await_handle.sb",
     "ExpectedExit": 0,
-    "ExpectedRuntimeOutputContains": ["handle reuse ok"]
+    "ExpectedRuntimeOutputContains": [
+      "handle reuse ok"
+    ]
   },
   {
     "kind": "stress",
@@ -1889,5 +1908,25 @@
     "Name": "invalid_return_bare_from_value",
     "File": "tests/invalid_return_bare_from_value.sb",
     "ExpectedErrorContains": "return with no value"
+  },
+  {
+    "kind": "stress",
+    "Name": "test_hash",
+    "File": "tests/test_hash.sb",
+    "ExpectedExit": 0,
+    "ExpectedRuntimeOutputContains": [
+      "hash: all tests passed\n"
+    ],
+    "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
+    "Name": "test_bitset",
+    "File": "tests/test_bitset.sb",
+    "ExpectedExit": 0,
+    "ExpectedRuntimeOutputContains": [
+      "bitset: all tests passed\n"
+    ],
+    "RuntimeTimeoutSeconds": 10
   }
 ]

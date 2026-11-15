@@ -382,6 +382,344 @@ function str ascii_hex_byte(int byte_value) {
     return out
 }
 )SBASCII"},
+        {"bitset", R"SBBITSET(import mem
+
+// Dynamic bitset: a growable array of bits backed by a heap block of 64-bit
+// words.
+//
+// Ownership:
+// - bitset_new / bitset_with_capacity / bitset_clone allocate; the caller owns
+//   the returned handle and must release it with bitset_free.
+// - every other function borrows the handle and allocates nothing.
+//
+// Layout: the handle is a view over a 24-byte header.
+//   [0]  words   : ptr  -> heap block of 8-byte words, words[0] is bit 0..63
+//   [8]  word_count : int  -> number of allocated words
+//   [16] bit_count  : int  -> number of valid bits (<= word_count*64)
+//
+// All bits above bit_count read as 0 and are cleared on resize, so a bits bit is
+// always a valid bit.
+
+view BitSet {
+    words: ptr @ 0
+    word_count: int @ 8
+    bit_count: int @ 16
+}
+
+// one word is 64 bits
+let BITSET_WORD_BITS: int = 64
+
+function int bitset_words_for(int bit_count) {
+    if bit_count <= 0 {
+        return 0
+    }
+    return (bit_count + BITSET_WORD_BITS - 1) / BITSET_WORD_BITS
+}
+
+function BitSet bitset_alloc_handle() {
+    var handle = malloc(24) as BitSet
+    if handle != 0 {
+        handle.words = 0
+        handle.word_count = 0
+        handle.bit_count = 0
+    }
+    return handle
+}
+
+function BitSet bitset_new() {
+    return bitset_with_capacity(64)
+}
+
+function BitSet bitset_with_capacity(int bit_count) {
+    if bit_count <= 0 {
+        return bitset_alloc_handle()
+    }
+    let needed = bitset_words_for(bit_count)
+    var block = mem.make_zero(needed * 8)
+    if block == 0 {
+        return 0 as BitSet
+    }
+    let handle = bitset_alloc_handle()
+    if handle == 0 {
+        free(block)
+        return 0 as BitSet
+    }
+    handle.words = block
+    handle.word_count = needed
+    // logical size is the requested count; the allocated words round up, but the
+    // tail bits are already zero so they read false
+    handle.bit_count = bit_count
+    return handle
+}
+
+function BitSet bitset_clone(BitSet source) {
+    if source == 0 {
+        return 0 as BitSet
+    }
+    let words = source.word_count
+    var block = 0 as ptr
+    if words > 0 {
+        block = mem.make_copy(source.words, words * 8)
+        if block == 0 {
+            return 0 as BitSet
+        }
+    }
+    let handle = bitset_alloc_handle()
+    if handle == 0 {
+        free(block)
+        return 0 as BitSet
+    }
+    handle.words = block
+    handle.word_count = words
+    handle.bit_count = source.bit_count
+    return handle
+}
+
+function void bitset_free(BitSet bits) {
+    if bits == 0 {
+        return
+    }
+    if bits.words != 0 {
+        free(bits.words)
+        bits.words = 0
+    }
+    free(bits)
+}
+
+function int bitset_len(BitSet bits) {
+    if bits == 0 {
+        return 0
+    }
+    return bits.bit_count
+}
+
+function bool bitset_is_empty(BitSet bits) {
+    if bits == 0 || bits.bit_count <= 0 {
+        return true
+    }
+    let words = bits.words as *i64
+    var i = 0
+    while i < bits.word_count {
+        if words[i] != 0 {
+            return false
+        }
+        i++
+    }
+    return true
+}
+
+// grow so that `bit_count` bits are representable. existing bits are preserved;
+// new bits are zero. returns false on allocation failure (the bits is untouched).
+function bool bitset_reserve(BitSet bits, int bit_count) {
+    if bits == 0 {
+        return false
+    }
+    if bit_count <= bits.bit_count {
+        return true
+    }
+    let old_words = bits.word_count
+    let new_words = bitset_words_for(bit_count)
+    if new_words <= old_words {
+        bits.bit_count = bit_count
+        return true
+    }
+    let block = mem.make_zero(new_words * 8)
+    if block == 0 {
+        return false
+    }
+    if old_words > 0 && bits.words != 0 {
+        mem.copy_cells(block, bits.words, old_words)
+        free(bits.words)
+    }
+    bits.words = block
+    bits.word_count = new_words
+    bits.bit_count = bit_count
+    return true
+}
+
+// read a bit. any index outside [0, bit_count) reads false.
+function bool bitset_get(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return false
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    let word = words[word_index]
+    return ((word >> bit_index) & 1) != 0
+}
+
+function i64 bitset_word_mask(int bit_index) {
+    return 1 << bit_index
+}
+
+// bits a bit to 1, growing if needed. returns false on allocation failure.
+function bool bitset_set(BitSet bits, int index) {
+    if bits == 0 || index < 0 {
+        return false
+    }
+    if index >= bits.bit_count {
+        if !bitset_reserve(bits, index + 1) {
+            return false
+        }
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] | bitset_word_mask(bit_index)
+    return true
+}
+
+// bits a bit to 0. does not grow; a bit outside the range is already 0.
+function void bitset_clear(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] & (bitset_word_mask(bit_index) ^ (0 - 1))
+}
+
+function void bitset_toggle(BitSet bits, int index) {
+    if bits == 0 || index < 0 || index >= bits.bit_count {
+        return
+    }
+    let word_index = index / BITSET_WORD_BITS
+    let bit_index = index % BITSET_WORD_BITS
+    let words = bits.words as *i64
+    words[word_index] = words[word_index] ^ bitset_word_mask(bit_index)
+}
+
+function void bitset_set_all(BitSet bits) {
+    if bits == 0 || bits.word_count <= 0 {
+        return
+    }
+    let words = bits.words as *i64
+    var i = 0
+    while i < bits.word_count {
+        words[i] = 0 - 1
+        i++
+    }
+    bitset_trim_tail(bits)
+}
+
+function void bitset_clear_all(BitSet bits) {
+    if bits == 0 || bits.words == 0 {
+        return
+    }
+    memset(bits.words, 0, bits.word_count * 8)
+}
+
+// the top word can hold bits beyond bit_count; mask them off after set_all.
+function void bitset_trim_tail(BitSet bits) {
+    if bits == 0 || bits.word_count <= 0 || bits.bit_count <= 0 {
+        return
+    }
+    let used_in_last = bits.bit_count % BITSET_WORD_BITS
+    if used_in_last == 0 {
+        return
+    }
+    let words = bits.words as *i64
+    let last = bits.word_count - 1
+    let keep = (1 << used_in_last) - 1
+    words[last] = words[last] & keep
+}
+
+// number of bits bits. cheap to compute, this is a straightforward popcount.
+function int bitset_count(BitSet bits) {
+    if bits == 0 || bits.words == 0 {
+        return 0
+    }
+    let words = bits.words as *i64
+    var total = 0
+    var i = 0
+    while i < bits.word_count {
+        var word = words[i]
+        while word != 0 {
+            word = word & (word - 1)
+            total++
+        }
+        i++
+    }
+    return total
+}
+
+// index of the first bits bit at or after `start`, or -1 if none.
+function int bitset_find_next(BitSet bits, int start) {
+    if bits == 0 || bits.bit_count <= 0 {
+        return -1
+    }
+    var index = start
+    if index < 0 {
+        index = 0
+    }
+    while index < bits.bit_count {
+        if bitset_get(bits, index) {
+            return index
+        }
+        index++
+    }
+    return -1
+}
+
+// bitset_set(a, index) for every bits bit in b. grows a as needed.
+function void bitset_or_into(BitSet target, BitSet source) {
+    if target == 0 || source == 0 {
+        return
+    }
+    var index = bitset_find_next(source, 0)
+    while index >= 0 {
+        bitset_set(target, index)
+        index = bitset_find_next(source, index + 1)
+    }
+}
+
+function int bitset_and_count(BitSet a, BitSet b) {
+    if a == 0 || b == 0 {
+        return 0
+    }
+    let words_a = a.words as *i64
+    let words_b = b.words as *i64
+    var shared = a.word_count
+    if b.word_count < shared {
+        shared = b.word_count
+    }
+    var total = 0
+    var i = 0
+    while i < shared {
+        var word = words_a[i] & words_b[i]
+        while word != 0 {
+            word = word & (word - 1)
+            total++
+        }
+        i++
+    }
+    return total
+}
+
+// true when a and b share at)SBBITSET"
+            R"SBBITSET( least one bits bit.
+function bool bitset_intersects(BitSet a, BitSet b) {
+    if a == 0 || b == 0 {
+        return false
+    }
+    let words_a = a.words as *i64
+    let words_b = b.words as *i64
+    var shared = a.word_count
+    if b.word_count < shared {
+        shared = b.word_count
+    }
+    var i = 0
+    while i < shared {
+        if (words_a[i] & words_b[i]) != 0 {
+            return true
+        }
+        i++
+    }
+    return false
+}
+)SBBITSET"},
         {"cpp_vector", R"SBCPPVECTO(import mem
 import vec
 
@@ -814,6 +1152,198 @@ function bool fs_contains(str file_path, str needle) {
     return ok
 }
 )SBFS"},
+        {"hash", R"SBHASH(import mem
+
+// Hashing and checksums.
+//
+// Every function here is pure over its inputs: nothing allocates, nothing frees,
+// nothing mutates the caller's memory. A hash is just an i64; run it through
+// hash_mix_i64 and hash_bucket before using it as an index, because the raw
+// hashes of short inputs are correlated in their low bits.
+//
+// Ownership: none of these functions return heap memory.
+
+// FNV-1a 64-bit constants.
+let HASH_FNV_OFFSET: i64 = 0xCBF29CE484222325
+let HASH_FNV_PRIME: i64 = 0x100000001B3
+
+// mask for the low 32 bits, used by the 32-bit CRC and the u32 wrapper.
+let HASH_MASK32: i64 = 0xFFFFFFFF
+
+// splitmix64 finalizer constants.
+let HASH_MIX_MUL1: i64 = 0xBF58476D1CE4E5B9
+let HASH_MIX_MUL2: i64 = 0x94D049BB133111EB
+
+// FNV-1a over a raw buffer. Empty input yields the offset basis, which is a
+// defined non-zero value, not an error.
+function i64 hash_fnv1a_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return HASH_FNV_OFFSET
+    }
+    let bytes = data as *u8
+    var h = HASH_FNV_OFFSET
+    var i = 0
+    while i < len {
+        h = h ^ (bytes[i] as i64)
+        h = h * HASH_FNV_PRIME
+        i++
+    }
+    return h
+}
+
+function i64 hash_fnv1a(str text_value) {
+    if text_value == 0 {
+        return HASH_FNV_OFFSET
+    }
+    return hash_fnv1a_bytes(text_value as ptr, string_length(text_value))
+}
+
+// FNV-1a over the 8 native bytes of an integer. Useful for hashing ids.
+function i64 hash_fnv1a_i64(i64 value) {
+    var h = HASH_FNV_OFFSET
+    var remaining = value
+    var i = 0
+    while i < 8 {
+        h = h ^ (remaining & 0xFF)
+        h = h * HASH_FNV_PRIME
+        remaining = remaining >> 8
+        i++
+    }
+    return h
+}
+
+// djb2: cheaper than FNV, weaker distribution. Handy for small string tables.
+function i64 hash_djb2(str text_value) {
+    if text_value == 0 {
+        return 5381
+    }
+    let len = string_length(text_value)
+    let bytes = text_value as ptr
+    var h = 5381
+    var i = 0
+    while i < len {
+        h = ((h << 5) + h) + mem.read8(bytes + i)
+        i++
+    }
+    return h
+}
+
+// CRC-32 (IEEE 802.3, polynomial 0xEDB88320) over a raw buffer.
+function i64 hash_crc32_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var crc = HASH_MASK32
+    var i = 0
+    while i < len {
+        crc = crc ^ (bytes[i] as i64)
+        var bit = 0
+        while bit < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320
+            } else {
+                crc = crc >> 1
+            }
+            bit++
+        }
+        i++
+    }
+    return crc ^ HASH_MASK32
+}
+
+function i64 hash_crc32(str text_value) {
+    if text_value == 0 {
+        return 0
+    }
+    return hash_crc32_bytes(text_value as ptr, string_length(text_value))
+}
+
+// splitmix64 finalizer: avalanches every input bit across the output. This is
+// the step that makes a sequential id usable as a hash table index.
+function i64 hash_mix_i64(i64 value) {
+    var x = value
+    x = x ^ (x >> 33)
+    x = x * HASH_MIX_MUL1
+    x = x ^ (x >> 29)
+    x = x * HASH_MIX_MUL2
+    x = x ^ (x >> 32)
+    return x
+}
+
+// Combine two hashes into one. Order matters, so (a, b) and (b, a) differ.
+function i64 hash_combine(i64 first, i64 second) {
+    return hash_mix_i64(first ^ (hash_mix_i64(second) + 0x9E3779B97F4A7C15))
+}
+
+// The low 32 bits, zero-extended. This is CRC-32's natural width.
+function i64 hash_to_u32(i64 value) {
+    return value & HASH_MASK32
+}
+
+// Map any hash onto [0, buckets). Returns 0 when buckets <= 0 so a bad bucket
+// count cannot divide by zero.
+function i64 hash_bucket(i64 value, int buckets) {
+    if buckets <= 0 {
+        return 0
+    }
+    let mixed = hash_mix_i64(value)
+    // keep the value non-negative before the modulo so the result is never
+    // negative for a negative hash
+    let positive = mixed & 0x7FFFFFFFFFFFFFFF
+    return positive % (buckets as i64)
+}
+
+// Sum of every byte, wrapping at 64 bits. A cheap integrity check, not a hash:
+// it cannot detect reordering.
+function i64 checksum_sum_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var total = 0
+    var i = 0
+    while i < len {
+        total = total + (bytes[i] as i64)
+        i++
+    }
+    return total
+}
+
+// XOR of every byte. Cheap, and sensitive to every byte, but blind to
+// duplicate bytes cancelling out.
+function i64 checksum_xor_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var acc = 0
+    var i = 0
+    while i < len {
+        acc = acc ^ (bytes[i] as i64)
+        i++
+    }
+    return acc
+}
+
+// Adler-32: two running sums mod 65521, combined into 32 bits. Stronger than a
+// plain sum for the same cost.
+function i64 checksum_adler32(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 1
+    }
+    let bytes = data as *u8
+    var a = 1
+    var b = 0
+    var i = 0
+    while i < len {
+        a = (a + (bytes[i] as i64)) % 65521
+        b = (b + a) % 65521
+        i++
+    }
+    return (b << 16) | a
+}
+)SBHASH"},
         {"http", R"SBHTTP(import mem
 
 // HTTP client helpers built on WinHTTP using typed function pointers and zero-copy views.

@@ -1,0 +1,181 @@
+import bitset
+
+// correctness of stdlib/bitset.sb: growable bit storage, counting, iteration,
+// and set algebra.
+
+function int test_basic_get_set() {
+    let s = bitset_new()
+    if s == 0 { print("FAIL new\n"); return 1 }
+    if bitset_len(s) != 64 { print("FAIL new len\n"); bitset_free(s); return 2 }
+
+    if bitset_get(s, 0) { print("FAIL fresh bit 0\n"); bitset_free(s); return 3 }
+    bitset_set(s, 5)
+    if !bitset_get(s, 5) { print("FAIL set bit 5\n"); bitset_free(s); return 4 }
+    if bitset_get(s, 4) { print("FAIL neighbor 4\n"); bitset_free(s); return 5 }
+    if bitset_get(s, 6) { print("FAIL neighbor 6\n"); bitset_free(s); return 6 }
+
+    bitset_clear(s, 5)
+    if bitset_get(s, 5) { print("FAIL clear bit 5\n"); bitset_free(s); return 7 }
+
+    bitset_toggle(s, 7)
+    if !bitset_get(s, 7) { print("FAIL toggle on\n"); bitset_free(s); return 8 }
+    bitset_toggle(s, 7)
+    if bitset_get(s, 7) { print("FAIL toggle off\n"); bitset_free(s); return 9 }
+
+    bitset_free(s)
+    return 0
+}
+
+function int test_grow() {
+    let s = bitset_new()
+    // set a bit well past the initial 64
+    if !bitset_set(s, 1000) { print("FAIL grow set\n"); bitset_free(s); return 1 }
+    if !bitset_get(s, 1000) { print("FAIL grow get\n"); bitset_free(s); return 2 }
+    if bitset_len(s) < 1001 { print("FAIL grow len\n"); bitset_free(s); return 3 }
+    // the other new bits must be zero
+    if bitset_get(s, 999) { print("FAIL grow neighbor\n"); bitset_free(s); return 4 }
+    if bitset_count(s) != 1 { print("FAIL grow count\n"); bitset_free(s); return 5 }
+
+    // out of range reads are false, out of range writes are ignored
+    if bitset_get(s, 100000) { print("FAIL oob get\n"); bitset_free(s); return 6 }
+    bitset_clear(s, 100000)
+    bitset_toggle(s, 100000)
+    if bitset_get(s, 100000) { print("FAIL oob toggle\n"); bitset_free(s); return 7 }
+    if bitset_set(s, 0 - 1) { print("FAIL negative set\n"); bitset_free(s); return 8 }
+
+    bitset_free(s)
+    return 0
+}
+
+function int test_count_and_find() {
+    let s = bitset_with_capacity(256)
+    var i = 0
+    while i < 256 {
+        if i % 3 == 0 {
+            bitset_set(s, i)
+        }
+        i++
+    }
+    // multiples of 3 in [0, 256): 0, 3, ..., 255 -> 86 values
+    if bitset_count(s) != 86 { print("FAIL count: "); print_int(bitset_count(s)); bitset_free(s); return 1 }
+
+    if bitset_find_next(s, 0) != 0 { print("FAIL find 0\n"); bitset_free(s); return 2 }
+    if bitset_find_next(s, 1) != 3 { print("FAIL find 3\n"); bitset_free(s); return 3 }
+    if bitset_find_next(s, 4) != 6 { print("FAIL find 6\n"); bitset_free(s); return 4 }
+    // past the last set bit
+    if bitset_find_next(s, 256) != -1 { print("FAIL find end\n"); bitset_free(s); return 5 }
+
+    // empty set finds nothing
+    let empty = bitset_new()
+    if bitset_find_next(empty, 0) != -1 { print("FAIL find empty\n"); bitset_free(empty); bitset_free(s); return 6 }
+    if !bitset_is_empty(empty) { print("FAIL is_empty\n"); bitset_free(empty); bitset_free(s); return 7 }
+    if bitset_count(empty) != 0 { print("FAIL empty count\n"); bitset_free(empty); bitset_free(s); return 8 }
+
+    bitset_free(empty)
+    bitset_free(s)
+    return 0
+}
+
+function int test_set_all_clear_all() {
+    let s = bitset_with_capacity(100)
+    bitset_set_all(s)
+    if bitset_count(s) != 100 { print("FAIL set_all count: "); print_int(bitset_count(s)); bitset_free(s); return 1 }
+    // the tail above bit 100 must not be observed
+    if bitset_get(s, 100) { print("FAIL tail leak\n"); bitset_free(s); return 2 }
+    bitset_clear_all(s)
+    if bitset_count(s) != 0 { print("FAIL clear_all\n"); bitset_free(s); return 3 }
+    if !bitset_is_empty(s) { print("FAIL clear_all empty\n"); bitset_free(s); return 4 }
+    bitset_free(s)
+    return 0
+}
+
+function int test_algebra() {
+    let a = bitset_with_capacity(64)
+    let b = bitset_with_capacity(64)
+    bitset_set(a, 1)
+    bitset_set(a, 2)
+    bitset_set(a, 3)
+    bitset_set(b, 3)
+    bitset_set(b, 4)
+
+    if bitset_and_count(a, b) != 1 { print("FAIL and_count\n"); bitset_free(a); bitset_free(b); return 1 }
+    if !bitset_intersects(a, b) { print("FAIL intersects\n"); bitset_free(a); bitset_free(b); return 2 }
+
+    let c = bitset_with_capacity(64)
+    bitset_set(c, 40)
+    if bitset_intersects(a, c) { print("FAIL disjoint\n"); bitset_free(a); bitset_free(b); bitset_free(c); return 3 }
+    if bitset_and_count(a, c) != 0 { print("FAIL and_count disjoint\n"); bitset_free(a); bitset_free(b); bitset_free(c); return 4 }
+
+    // or_into copies b's bits into a
+    bitset_or_into(a, b)
+    if bitset_count(a) != 4 { print("FAIL or count: "); print_int(bitset_count(a)); bitset_free(a); bitset_free(b); bitset_free(c); return 5 }
+    if !bitset_get(a, 4) { print("FAIL or bit\n"); bitset_free(a); bitset_free(b); bitset_free(c); return 6 }
+
+    bitset_free(a)
+    bitset_free(b)
+    bitset_free(c)
+    return 0
+}
+
+function int test_clone() {
+    let a = bitset_with_capacity(128)
+    bitset_set(a, 1)
+    bitset_set(a, 65)
+    bitset_set(a, 127)
+
+    let b = bitset_clone(a)
+    if b == 0 { print("FAIL clone\n"); bitset_free(a); return 1 }
+    if bitset_count(b) != 3 { print("FAIL clone count\n"); bitset_free(a); bitset_free(b); return 2 }
+    if !bitset_get(b, 65) { print("FAIL clone bit\n"); bitset_free(a); bitset_free(b); return 3 }
+
+    // mutating the clone must not affect the source
+    bitset_clear(b, 65)
+    if !bitset_get(a, 65) { print("FAIL clone independence\n"); bitset_free(a); bitset_free(b); return 4 }
+    if bitset_get(b, 65) { print("FAIL clone mutation\n"); bitset_free(a); bitset_free(b); return 5 }
+
+    bitset_free(a)
+    bitset_free(b)
+    return 0
+}
+
+function int test_null_safety() {
+    let null_set: BitSet = 0 as BitSet
+    // every accessor must tolerate a null handle rather than faulting
+    if bitset_len(null_set) != 0 { print("FAIL null len\n"); return 1 }
+    if !bitset_is_empty(null_set) { print("FAIL null empty\n"); return 2 }
+    if bitset_count(null_set) != 0 { print("FAIL null count\n"); return 3 }
+    if bitset_get(null_set, 0) { print("FAIL null get\n"); return 4 }
+    if bitset_find_next(null_set, 0) != -1 { print("FAIL null find\n"); return 5 }
+    if bitset_set(null_set, 0) { print("FAIL null set\n"); return 6 }
+    if bitset_reserve(null_set, 64) { print("FAIL null reserve\n"); return 7 }
+    if bitset_intersects(null_set, null_set) { print("FAIL null intersects\n"); return 8 }
+    bitset_clear(null_set, 0)
+    bitset_toggle(null_set, 0)
+    bitset_set_all(null_set)
+    bitset_clear_all(null_set)
+    bitset_free(null_set)
+    if bitset_clone(null_set) != 0 { print("FAIL null clone\n"); return 9 }
+    return 0
+}
+
+function int main() {
+    alloc_console()
+
+    let r1 = test_basic_get_set()
+    if r1 != 0 { return 10 + r1 }
+    let r2 = test_grow()
+    if r2 != 0 { return 20 + r2 }
+    let r3 = test_count_and_find()
+    if r3 != 0 { return 30 + r3 }
+    let r4 = test_set_all_clear_all()
+    if r4 != 0 { return 40 + r4 }
+    let r5 = test_algebra()
+    if r5 != 0 { return 50 + r5 }
+    let r6 = test_clone()
+    if r6 != 0 { return 60 + r6 }
+    let r7 = test_null_safety()
+    if r7 != 0 { return 70 + r7 }
+
+    print("bitset: all tests passed\n")
+    return 0
+}

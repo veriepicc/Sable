@@ -1,0 +1,191 @@
+import mem
+
+// Hashing and checksums.
+//
+// Every function here is pure over its inputs: nothing allocates, nothing frees,
+// nothing mutates the caller's memory. A hash is just an i64; run it through
+// hash_mix_i64 and hash_bucket before using it as an index, because the raw
+// hashes of short inputs are correlated in their low bits.
+//
+// Ownership: none of these functions return heap memory.
+
+// FNV-1a 64-bit constants.
+let HASH_FNV_OFFSET: i64 = 0xCBF29CE484222325
+let HASH_FNV_PRIME: i64 = 0x100000001B3
+
+// mask for the low 32 bits, used by the 32-bit CRC and the u32 wrapper.
+let HASH_MASK32: i64 = 0xFFFFFFFF
+
+// splitmix64 finalizer constants.
+let HASH_MIX_MUL1: i64 = 0xBF58476D1CE4E5B9
+let HASH_MIX_MUL2: i64 = 0x94D049BB133111EB
+
+// FNV-1a over a raw buffer. Empty input yields the offset basis, which is a
+// defined non-zero value, not an error.
+function i64 hash_fnv1a_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return HASH_FNV_OFFSET
+    }
+    let bytes = data as *u8
+    var h = HASH_FNV_OFFSET
+    var i = 0
+    while i < len {
+        h = h ^ (bytes[i] as i64)
+        h = h * HASH_FNV_PRIME
+        i++
+    }
+    return h
+}
+
+function i64 hash_fnv1a(str text_value) {
+    if text_value == 0 {
+        return HASH_FNV_OFFSET
+    }
+    return hash_fnv1a_bytes(text_value as ptr, string_length(text_value))
+}
+
+// FNV-1a over the 8 native bytes of an integer. Useful for hashing ids.
+function i64 hash_fnv1a_i64(i64 value) {
+    var h = HASH_FNV_OFFSET
+    var remaining = value
+    var i = 0
+    while i < 8 {
+        h = h ^ (remaining & 0xFF)
+        h = h * HASH_FNV_PRIME
+        remaining = remaining >> 8
+        i++
+    }
+    return h
+}
+
+// djb2: cheaper than FNV, weaker distribution. Handy for small string tables.
+function i64 hash_djb2(str text_value) {
+    if text_value == 0 {
+        return 5381
+    }
+    let len = string_length(text_value)
+    let bytes = text_value as ptr
+    var h = 5381
+    var i = 0
+    while i < len {
+        h = ((h << 5) + h) + mem.read8(bytes + i)
+        i++
+    }
+    return h
+}
+
+// CRC-32 (IEEE 802.3, polynomial 0xEDB88320) over a raw buffer.
+function i64 hash_crc32_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var crc = HASH_MASK32
+    var i = 0
+    while i < len {
+        crc = crc ^ (bytes[i] as i64)
+        var bit = 0
+        while bit < 8 {
+            if (crc & 1) != 0 {
+                crc = (crc >> 1) ^ 0xEDB88320
+            } else {
+                crc = crc >> 1
+            }
+            bit++
+        }
+        i++
+    }
+    return crc ^ HASH_MASK32
+}
+
+function i64 hash_crc32(str text_value) {
+    if text_value == 0 {
+        return 0
+    }
+    return hash_crc32_bytes(text_value as ptr, string_length(text_value))
+}
+
+// splitmix64 finalizer: avalanches every input bit across the output. This is
+// the step that makes a sequential id usable as a hash table index.
+function i64 hash_mix_i64(i64 value) {
+    var x = value
+    x = x ^ (x >> 33)
+    x = x * HASH_MIX_MUL1
+    x = x ^ (x >> 29)
+    x = x * HASH_MIX_MUL2
+    x = x ^ (x >> 32)
+    return x
+}
+
+// Combine two hashes into one. Order matters, so (a, b) and (b, a) differ.
+function i64 hash_combine(i64 first, i64 second) {
+    return hash_mix_i64(first ^ (hash_mix_i64(second) + 0x9E3779B97F4A7C15))
+}
+
+// The low 32 bits, zero-extended. This is CRC-32's natural width.
+function i64 hash_to_u32(i64 value) {
+    return value & HASH_MASK32
+}
+
+// Map any hash onto [0, buckets). Returns 0 when buckets <= 0 so a bad bucket
+// count cannot divide by zero.
+function i64 hash_bucket(i64 value, int buckets) {
+    if buckets <= 0 {
+        return 0
+    }
+    let mixed = hash_mix_i64(value)
+    // keep the value non-negative before the modulo so the result is never
+    // negative for a negative hash
+    let positive = mixed & 0x7FFFFFFFFFFFFFFF
+    return positive % (buckets as i64)
+}
+
+// Sum of every byte, wrapping at 64 bits. A cheap integrity check, not a hash:
+// it cannot detect reordering.
+function i64 checksum_sum_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var total = 0
+    var i = 0
+    while i < len {
+        total = total + (bytes[i] as i64)
+        i++
+    }
+    return total
+}
+
+// XOR of every byte. Cheap, and sensitive to every byte, but blind to
+// duplicate bytes cancelling out.
+function i64 checksum_xor_bytes(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 0
+    }
+    let bytes = data as *u8
+    var acc = 0
+    var i = 0
+    while i < len {
+        acc = acc ^ (bytes[i] as i64)
+        i++
+    }
+    return acc
+}
+
+// Adler-32: two running sums mod 65521, combined into 32 bits. Stronger than a
+// plain sum for the same cost.
+function i64 checksum_adler32(ptr data, int len) {
+    if data == 0 || len <= 0 {
+        return 1
+    }
+    let bytes = data as *u8
+    var a = 1
+    var b = 0
+    var i = 0
+    while i < len {
+        a = (a + (bytes[i] as i64)) % 65521
+        b = (b + a) % 65521
+        i++
+    }
+    return (b << 16) | a
+}
