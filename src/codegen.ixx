@@ -4195,6 +4195,7 @@ private:
             [&](const ast::SwitchStmt& s) {
                 if (expr_contains_non_inlined_call(*s.subject)) return true;
                 for (const auto& branch : s.cases) {
+                    if (expr_contains_non_inlined_call(*branch.value)) return true;
                     for (const auto& inner : branch.body) {
                         if (stmt_contains_non_inlined_call(*inner)) return true;
                     }
@@ -6867,10 +6868,11 @@ private:
                 bool registerizable_immutable_init =
                     !let.is_mut && let.init && can_registerize_immutable_let_init(*let.init);
                 auto last_use = find_last_ident_use_in_range(let.name, stmts, i + 1);
+                // the last statement can call before it reads the local
                 bool lives_across_call =
-                    last_use && range_contains_non_inlined_call(stmts, i + 1, *last_use);
+                    last_use && range_contains_non_inlined_call(stmts, i + 1, *last_use + 1);
                 bool lives_across_any_call =
-                    last_use && range_contains_call(stmts, i + 1, *last_use);
+                    last_use && range_contains_call(stmts, i + 1, *last_use + 1);
                 if (registerizable_immutable_init &&
                     !later_call_arg_uses &&
                     !lives_across_call &&
