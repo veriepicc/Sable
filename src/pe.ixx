@@ -270,7 +270,8 @@ public:
         std::size_t data_rva = rdata_rva + kSectAlign;
         std::size_t reloc_rva_slot = data_rva + kSectAlign;  // .reloc always present
         std::size_t src_rva = reloc_rva_slot + kSectAlign;   // .src section for debug
-        std::size_t srcmap_rva = has_debug && has_linemap ? (src_rva + kSectAlign) : 0;
+        const std::size_t src_size = has_debug ? cfg.debug_source.size() + 1 : 0;
+        std::size_t srcmap_rva = has_linemap ? src_rva + align_up(src_size, kSectAlign) : 0;
         
         // Patch IAT fixups in user_code before building the text section
         std::size_t user_code_offset = layout.startup_code_size;
@@ -315,7 +316,7 @@ public:
         // iat lives at the start of .data now, globals come after, then debug data if needed
         std::size_t data_raw_size = imports.iat_data.size() + 0x100 + layout.data_extra;
         std::size_t data_file_sz = align_up(data_raw_size, kFileAlign);
-        std::size_t src_file_sz = has_debug ? align_up(cfg.debug_source.size() + 1, kFileAlign) : 0;
+        std::size_t src_file_sz = align_up(src_size, kFileAlign);
         // line map: 8 bytes per entry (4 bytes offset + 4 bytes line)
         std::size_t srcmap_file_sz = has_linemap ? align_up(cfg.line_map.size() * 8 + 4, kFileAlign) : 0;
         
@@ -338,7 +339,7 @@ public:
         image_size = (std::max)(image_size, section_end(data_rva, data_raw_size));
         image_size = (std::max)(image_size, section_end(reloc_rva, reloc_raw_size));
         if (has_debug) {
-            image_size = (std::max)(image_size, section_end(src_rva, cfg.debug_source.size() + 1));
+            image_size = (std::max)(image_size, section_end(src_rva, src_size));
         }
         if (has_linemap) {
             image_size = (std::max)(image_size, section_end(srcmap_rva, cfg.line_map.size() * 8 + 4));
@@ -442,7 +443,7 @@ public:
         if (has_debug) {
             IMAGE_SECTION_HEADER src_sh = {};
             memcpy(src_sh.Name, ".src", 4);
-            src_sh.Misc.VirtualSize = static_cast<DWORD>(cfg.debug_source.size() + 1);
+            src_sh.Misc.VirtualSize = static_cast<DWORD>(src_size);
             src_sh.VirtualAddress = static_cast<DWORD>(src_rva);
             src_sh.SizeOfRawData = static_cast<DWORD>(src_file_sz);
             src_sh.PointerToRawData = static_cast<DWORD>(kHeaderSize + text_file_sz + rdata_file_sz + data_file_sz + reloc_file_sz);

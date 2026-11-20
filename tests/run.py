@@ -171,9 +171,14 @@ def execute(case, compiler, workspace, timeout):
             if case['Healing'] != 'auto' or kind != 'stress':
                 raise AssertionError('healing is only supported for explicit auto-recovery stress cases')
             isolated = workspace / '.recovery' / source.relative_to(workspace).with_suffix('')
+            if case.get('SourcePaddingBytes'):
+                isolated = isolated.with_name(f'{isolated.name}-padded')
             isolated.mkdir(parents=True, exist_ok=True)
             copied = isolated / source.name
             shutil.copy2(source, copied)
+            if padding := case.get('SourcePaddingBytes'):
+                with copied.open('ab') as output:
+                    output.write(b'\n//' + b'x' * padding + b'\n')
             source = copied
             (isolated / 'sable.project').write_text(
                 'project Recovery {\n'

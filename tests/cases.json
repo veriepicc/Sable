@@ -958,6 +958,19 @@
   },
   {
     "kind": "stress",
+    "Name": "healing_large_debug_source",
+    "File": "tests/stress_memory/positive/test_null_ptr_deref.sb",
+    "Healing": "auto",
+    "SourcePaddingBytes": 4096,
+    "ExpectedExit": 0,
+    "ExpectedRuntimeOutputContains": [
+      "ACCESS_VIOLATION",
+      "Location: line",
+      "null read recovered\n"
+    ]
+  },
+  {
+    "kind": "stress",
     "Name": "tests/stress_memory/positive/test_ptr_arithmetic.sb",
     "File": "tests/stress_memory/positive/test_ptr_arithmetic.sb"
   },
