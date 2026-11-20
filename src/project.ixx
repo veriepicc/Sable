@@ -48,9 +48,13 @@ std::expected<ProjectConfig, std::string> load_project(const std::filesystem::pa
     }
     
     ProjectConfig config;
+    auto project_parent = project_path.parent_path();
+    if (project_parent.empty()) {
+        project_parent = ".";
+    }
     std::error_code project_dir_ec;
-    auto project_dir = std::filesystem::weakly_canonical(project_path.parent_path(), project_dir_ec);
-    config.project_dir = project_dir_ec ? project_path.parent_path().lexically_normal() : project_dir;
+    auto project_dir = std::filesystem::weakly_canonical(project_parent, project_dir_ec);
+    config.project_dir = project_dir_ec ? project_parent.lexically_normal() : project_dir;
 
     const auto& proj = *result;
     config.name = proj.name;

@@ -185,7 +185,11 @@ def execute(case, compiler, workspace, timeout):
                 f'    entry: "{source.name}"\n'
                 '    mode: "exe"\n    debug: true\n    healing: "auto"\n}\n')
         args = ['build', source] if 'project' in kind else ['--run', source] if kind == 'run' else [source]
-        proc = invoke(command(compiler, *args), workspace, timeout)
+        build_cwd = workspace
+        if case.get('BareProjectPath'):
+            args = ['build', source.name]
+            build_cwd = source.parent
+        proc = invoke(command(compiler, *args), build_cwd, timeout)
         check_crash(proc)
         if kind.startswith('reject'):
             check_rejection(proc, case.get('ExpectedErrorContains'))

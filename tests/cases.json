@@ -553,6 +553,7 @@
     "kind": "project",
     "Name": "project_test7_nested_import_alias",
     "ProjectFile": "tests/project_tests/test7/sable.project",
+    "BareProjectPath": true,
     "ExeFile": "tests/project_tests/test7/Test7.exe",
     "ExpectedExit": 42,
     "RuntimeTimeoutSeconds": 5
@@ -1816,6 +1817,12 @@
     "File": "tests/test_http_client.sb",
     "ExpectedExit": 0,
     "RuntimeTimeoutSeconds": 10
+  },
+  {
+    "kind": "stress",
+    "Name": "test_immutable_local_across_call",
+    "File": "tests/test_immutable_local_across_call.sb",
+    "ExpectedExit": 0
   },
   {
     "kind": "stress",

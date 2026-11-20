@@ -1,0 +1,27 @@
+function i64 MixArguments(i64 a, i64 b, i64 c, i64 d, i64 e) {
+    let first = a + b;
+    let second = c + d;
+    if (a < 0) { return a; }
+    if (b < 0) { return b; }
+    if (c < 0) { return c; }
+    if (d < 0) { return d; }
+    if (e < 0) { return e; }
+    if (first > second) { return first * e + second; }
+    return second * e + first;
+}
+
+function i64 CheckAcrossCall(i64 square, i64 side) {
+    let ahead = square + side * 16;
+    let mut score: i64 = 0;
+    if (ahead > 0) {
+        score = MixArguments(10, 20, 30, 40, 50);
+        score = score + ahead;
+        score = score + ahead * 2;
+    }
+    return score;
+}
+
+function int main() {
+    if (CheckAcrossCall(18, 1) != 3632) { return 1; }
+    return 0;
+}
