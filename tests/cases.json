@@ -1998,5 +1998,191 @@
       "http parity: all tests passed\n"
     ],
     "RuntimeTimeoutSeconds": 15
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_0367fb0fe311",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_0367fb0fe311.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_13f773216022",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_13f773216022.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_14a3d22b4e8b",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_14a3d22b4e8b.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_1f0f20eff5b0",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_1f0f20eff5b0.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_2116032b3249",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_2116032b3249.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_3cab5458b686",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_3cab5458b686.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_3ebdef1a5798",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_3ebdef1a5798.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_40c647352920",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_40c647352920.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_451a3a6dbffc",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_451a3a6dbffc.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_56da7e560023",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_56da7e560023.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_5a40cfb39e20",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_5a40cfb39e20.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_5f9c0a69f27c",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_5f9c0a69f27c.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_729c301622c8",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_729c301622c8.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_7a70b3dff517",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_7a70b3dff517.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_7a76e0cabcec",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_7a76e0cabcec.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_8a7c2c08a15a",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_8a7c2c08a15a.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_8d340aa6f73a",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_8d340aa6f73a.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_993d741c3c40",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_993d741c3c40.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_99684fdd314b",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_99684fdd314b.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_9a58016b5442",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_9a58016b5442.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_9d5d4cfa96f7",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_9d5d4cfa96f7.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_afadcd561910",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_afadcd561910.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_b0445ecd2e76",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_b0445ecd2e76.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_b236be3bfde5",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_b236be3bfde5.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_d23ba949d308",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_d23ba949d308.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_d97d55f058d0",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_d97d55f058d0.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_de792216447f",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_de792216447f.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_e2a287f50bb7",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_e2a287f50bb7.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_f79b96508e82",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_f79b96508e82.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_f84f48cc0c67",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_f84f48cc0c67.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
+  },
+  {
+    "kind": "reject",
+    "Name": "fuzz_reject_hang_fa2eca37e634",
+    "File": "tests/fuzz_regressions/crash_runtime_hang_fa2eca37e634.sb",
+    "ExpectedErrorContains": "cannot rebind immutable variable"
   }
 ]
