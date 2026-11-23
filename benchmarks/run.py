@@ -119,7 +119,7 @@ def ensure_tcc(work_dir):
     url = "https://download.savannah.gnu.org/releases/tinycc/tcc-0.9.27-win64-bin.zip"
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        with urllib.request.urlopen(req, timeout=2) as resp, open(zip_path, 'wb') as out_file:
+        with urllib.request.urlopen(req, timeout=30) as resp, open(zip_path, 'wb') as out_file:
             shutil.copyfileobj(resp, out_file)
         with zipfile.ZipFile(zip_path, "r") as z:
             z.extractall(work_dir)
@@ -221,6 +221,9 @@ def run_proc_mem(cmd):
         import ctypes
         from ctypes import wintypes
         k32 = ctypes.windll.kernel32
+        # GetProcessMemoryInfo lives in psapi.dll; kernel32 only exports the K32 alias
+        getmem = getattr(ctypes.windll.psapi, "GetProcessMemoryInfo", None) or \
+            getattr(k32, "K32GetProcessMemoryInfo", None)
         h = k32.OpenProcess(0x0400 | 0x0010, False, p.pid)
         out, err = p.communicate(timeout=120)
         if h:
@@ -234,7 +237,7 @@ def run_proc_mem(cmd):
                 ]
             pmc = PMC()
             pmc.cb = ctypes.sizeof(PMC)
-            if k32.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+            if getmem and getmem(h, ctypes.byref(pmc), pmc.cb):
                 peak = int(pmc.PeakWorkingSetSize)
             k32.CloseHandle(h)
     else:
