@@ -6,6 +6,98 @@
 #endif
 
 // ============================================================================
+// THREAD + SIMD LAYER (vectorized benchmarks 6 - 10 only)
+// the sable counterparts use parallel for + auto-vectorization, so the C
+// side gets real os threads and exact int64 avx2 kernels to match. chunks
+// are disjoint so every toolchain lands on the same checksum.
+// ============================================================================
+
+#if BENCH >= 6
+
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <unistd.h>
+#endif
+
+#if defined(__AVX2__) && !defined(__TINYC__)
+#include <immintrin.h>
+#define BENCH_SIMD 1
+#else
+#define BENCH_SIMD 0
+#endif
+
+typedef void (*bench_worker)(void* ctx, int64_t lo, int64_t hi);
+typedef struct { bench_worker fn; void* ctx; int64_t lo, hi; } bench_job;
+
+#ifdef _WIN32
+static DWORD WINAPI bench_thunk(LPVOID p) {
+    bench_job* j = (bench_job*)p;
+    j->fn(j->ctx, j->lo, j->hi);
+    return 0;
+}
+#else
+static void* bench_thunk(void* p) {
+    bench_job* j = (bench_job*)p;
+    j->fn(j->ctx, j->lo, j->hi);
+    return NULL;
+}
+#endif
+
+static int bench_threads(void) {
+#ifdef _WIN32
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    long n = (long)si.dwNumberOfProcessors;
+#else
+    long n = sysconf(_SC_NPROCESSORS_ONLN);
+#endif
+    if (n < 1) n = 1;
+    if (n > 64) n = 64;
+    return (int)n;
+}
+
+static void bench_parallel(int64_t n, bench_worker fn, void* ctx) {
+    int t = bench_threads();
+    if ((int64_t)t > n) t = (int)n;
+    if (t < 1) t = 1;
+    bench_job jobs[64];
+#ifdef _WIN32
+    HANDLE hs[64];
+#else
+    pthread_t hs[64];
+#endif
+    int64_t chunk = (n + t - 1) / t;
+    int spawned = 0;
+    for (int k = 0; k < t; k++) {
+        int64_t lo = (int64_t)k * chunk;
+        int64_t hi = lo + chunk;
+        if (hi > n) hi = n;
+        if (lo >= hi) break;
+        jobs[k].fn = fn; jobs[k].ctx = ctx; jobs[k].lo = lo; jobs[k].hi = hi;
+#ifdef _WIN32
+        hs[spawned] = CreateThread(NULL, 0, bench_thunk, &jobs[k], 0, NULL);
+        if (hs[spawned]) spawned++;
+        else fn(ctx, lo, hi);
+#else
+        if (pthread_create(&hs[spawned], NULL, bench_thunk, &jobs[k]) == 0) spawned++;
+        else fn(ctx, lo, hi);
+#endif
+    }
+#ifdef _WIN32
+    if (spawned) WaitForMultipleObjects((DWORD)spawned, hs, TRUE, INFINITE);
+    for (int k = 0; k < spawned; k++) CloseHandle(hs[k]);
+#else
+    for (int k = 0; k < spawned; k++) pthread_join(hs[k], NULL);
+#endif
+}
+
+typedef struct { int64_t *a, *b, *out; } bench_bufs;
+
+#endif
+
+// ============================================================================
 // SCALAR BENCHMARKS (1 - 5)
 // ============================================================================
 
@@ -144,92 +236,183 @@ int main(void) {
 }
 
 // ============================================================================
-// VECTORIZED BENCHMARKS (6 - 10)
+// VECTORIZED BENCHMARKS (6 - 10): os threads + exact avx2 int64 kernels
 // ============================================================================
 
 #elif BENCH == 6
 // Math Vectorized (40M elements)
+static void init6(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    for (int64_t i = lo; i < hi; i++) x->a[i] = i;
+}
+static void work6(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    int64_t i = lo;
+#if BENCH_SIMD
+    const __m256i one = _mm256_set1_epi64x(1);
+    for (; i + 4 <= hi; i += 4) {
+        __m256i av = _mm256_loadu_si256((const __m256i*)(x->a + i));
+        _mm256_storeu_si256((__m256i*)(x->out + i),
+                            _mm256_add_epi64(_mm256_slli_epi64(av, 3), one));
+    }
+#endif
+    for (; i < hi; i++) x->out[i] = x->a[i] * 8 + 1;
+}
 int main(void) {
     int64_t n = 40000000;
-    int64_t* a = (int64_t*)malloc(n * sizeof(int64_t));
-    int64_t* y = (int64_t*)malloc(n * sizeof(int64_t));
-    if (!a || !y) return 1;
-    for (int64_t i = 0; i < n; i++) a[i] = i;
-    for (int64_t i = 0; i < n; i++) {
-        y[i] = a[i] * 8 + 1;
-    }
-    int64_t check = y[n / 2];
-    free(a); free(y);
+    bench_bufs x;
+    x.a = (int64_t*)malloc(n * sizeof(int64_t));
+    x.b = NULL;
+    x.out = (int64_t*)malloc(n * sizeof(int64_t));
+    if (!x.a || !x.out) return 1;
+    bench_parallel(n, init6, &x);
+    bench_parallel(n, work6, &x);
+    int64_t check = x.out[n / 2];
+    free(x.a); free(x.out);
     return (int)check;
 }
 
 #elif BENCH == 7
 // State Vectorized (40M elements)
+static void init7(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    for (int64_t i = lo; i < hi; i++) { x->a[i] = 1; x->b[i] = 3; }
+}
+static void work7(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    int64_t i = lo;
+#if BENCH_SIMD
+    const __m256i three = _mm256_set1_epi64x(3);
+    const __m256i five = _mm256_set1_epi64x(5);
+    for (; i + 4 <= hi; i += 4) {
+        __m256i av = _mm256_loadu_si256((const __m256i*)(x->a + i));
+        __m256i bv = _mm256_loadu_si256((const __m256i*)(x->b + i));
+        _mm256_storeu_si256((__m256i*)(x->out + i),
+                            _mm256_add_epi64(_mm256_add_epi64(av, three),
+                                             _mm256_add_epi64(bv, five)));
+    }
+#endif
+    for (; i < hi; i++) x->out[i] = (x->a[i] + 3) + (x->b[i] + 5);
+}
 int main(void) {
     int64_t n = 40000000;
-    int64_t* a = (int64_t*)malloc(n * sizeof(int64_t));
-    int64_t* b = (int64_t*)malloc(n * sizeof(int64_t));
-    int64_t* out = (int64_t*)malloc(n * sizeof(int64_t));
-    if (!a || !b || !out) return 1;
-    for (int64_t i = 0; i < n; i++) a[i] = 1;
-    for (int64_t i = 0; i < n; i++) b[i] = 3;
-    for (int64_t i = 0; i < n; i++) {
-        out[i] = (a[i] + 3) + (b[i] + 5);
-    }
-    int64_t check = out[n / 2];
-    free(a); free(b); free(out);
+    bench_bufs x;
+    x.a = (int64_t*)malloc(n * sizeof(int64_t));
+    x.b = (int64_t*)malloc(n * sizeof(int64_t));
+    x.out = (int64_t*)malloc(n * sizeof(int64_t));
+    if (!x.a || !x.b || !x.out) return 1;
+    bench_parallel(n, init7, &x);
+    bench_parallel(n, work7, &x);
+    int64_t check = x.out[n / 2];
+    free(x.a); free(x.b); free(x.out);
     return (int)check;
 }
 
 #elif BENCH == 8
 // Branch Vectorized (40M elements)
+static void init8(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    for (int64_t i = lo; i < hi; i++) x->a[i] = i;
+}
+static void work8(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    int64_t i = lo;
+#if BENCH_SIMD
+    const __m256i one = _mm256_set1_epi64x(1);
+    for (; i + 4 <= hi; i += 4) {
+        __m256i av = _mm256_loadu_si256((const __m256i*)(x->a + i));
+        __m256i par = _mm256_and_si256(av, one);
+        __m256i p3 = _mm256_add_epi64(par, _mm256_slli_epi64(par, 1));
+        __m256i a5 = _mm256_add_epi64(_mm256_slli_epi64(av, 2), av);
+        _mm256_storeu_si256((__m256i*)(x->out + i), _mm256_add_epi64(p3, a5));
+    }
+#endif
+    for (; i < hi; i++) x->out[i] = (x->a[i] & 1) * 3 + x->a[i] * 5;
+}
 int main(void) {
     int64_t n = 40000000;
-    int64_t* a = (int64_t*)malloc(n * sizeof(int64_t));
-    int64_t* out = (int64_t*)malloc(n * sizeof(int64_t));
-    if (!a || !out) return 1;
-    for (int64_t i = 0; i < n; i++) a[i] = i;
-    for (int64_t i = 0; i < n; i++) {
-        out[i] = (a[i] & 1) * 3 + a[i] * 5;
-    }
-    int64_t check = out[n / 2];
-    free(a); free(out);
+    bench_bufs x;
+    x.a = (int64_t*)malloc(n * sizeof(int64_t));
+    x.b = NULL;
+    x.out = (int64_t*)malloc(n * sizeof(int64_t));
+    if (!x.a || !x.out) return 1;
+    bench_parallel(n, init8, &x);
+    bench_parallel(n, work8, &x);
+    int64_t check = x.out[n / 2];
+    free(x.a); free(x.out);
     return (int)(check & 255);
 }
 
 #elif BENCH == 9
 // General Vectorized (20M elements)
+static void init9(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    for (int64_t i = lo; i < hi; i++) { x->a[i] = 7; x->b[i] = 11; }
+}
+static void work9(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    int64_t i = lo;
+#if BENCH_SIMD
+    const __m256i c31 = _mm256_set1_epi64x(31);
+    for (; i + 4 <= hi; i += 4) {
+        __m256i av = _mm256_loadu_si256((const __m256i*)(x->a + i));
+        __m256i bv = _mm256_loadu_si256((const __m256i*)(x->b + i));
+        __m256i a17 = _mm256_add_epi64(_mm256_slli_epi64(av, 4), av);
+        __m256i b3 = _mm256_add_epi64(_mm256_slli_epi64(bv, 1), bv);
+        _mm256_storeu_si256((__m256i*)(x->out + i),
+                            _mm256_add_epi64(_mm256_add_epi64(a17, c31),
+                                             _mm256_add_epi64(av, b3)));
+    }
+#endif
+    for (; i < hi; i++) x->out[i] = (x->a[i] * 17 + 31) + (x->a[i] + x->b[i] * 3);
+}
 int main(void) {
     int64_t n = 20000000;
-    int64_t* a = (int64_t*)malloc(n * sizeof(int64_t));
-    int64_t* b = (int64_t*)malloc(n * sizeof(int64_t));
-    int64_t* c = (int64_t*)malloc(n * sizeof(int64_t));
-    if (!a || !b || !c) return 1;
-    for (int64_t i = 0; i < n; i++) a[i] = 7;
-    for (int64_t i = 0; i < n; i++) b[i] = 11;
-    for (int64_t i = 0; i < n; i++) {
-        c[i] = (a[i] * 17 + 31) + (a[i] + b[i] * 3);
-    }
-    int64_t check = c[n / 2];
-    free(a); free(b); free(c);
+    bench_bufs x;
+    x.a = (int64_t*)malloc(n * sizeof(int64_t));
+    x.b = (int64_t*)malloc(n * sizeof(int64_t));
+    x.out = (int64_t*)malloc(n * sizeof(int64_t));
+    if (!x.a || !x.b || !x.out) return 1;
+    bench_parallel(n, init9, &x);
+    bench_parallel(n, work9, &x);
+    int64_t check = x.out[n / 2];
+    free(x.a); free(x.b); free(x.out);
     return (int)check;
 }
 
 #elif BENCH == 10
 // HFT Vectorized (20M elements)
+static void init10(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    for (int64_t i = lo; i < hi; i++) { x->a[i] = 100000 + (i & 7); x->b[i] = 100005 + (i & 7); }
+}
+static void work10(void* c, int64_t lo, int64_t hi) {
+    bench_bufs* x = (bench_bufs*)c;
+    int64_t i = lo;
+#if BENCH_SIMD
+    const __m256i c17 = _mm256_set1_epi64x(17);
+    for (; i + 4 <= hi; i += 4) {
+        __m256i av = _mm256_loadu_si256((const __m256i*)(x->a + i));
+        __m256i bv = _mm256_loadu_si256((const __m256i*)(x->b + i));
+        __m256i spread8 = _mm256_slli_epi64(_mm256_sub_epi64(bv, av), 3);
+        __m256i bid2 = _mm256_slli_epi64(av, 1);
+        _mm256_storeu_si256((__m256i*)(x->out + i),
+                            _mm256_sub_epi64(_mm256_add_epi64(spread8, bid2), c17));
+    }
+#endif
+    for (; i < hi; i++) x->out[i] = ((x->b[i] - x->a[i]) * 8) + (x->a[i] * 2) - 17;
+}
 int main(void) {
     int64_t n = 20000000;
-    int64_t* bid = (int64_t*)malloc(n * sizeof(int64_t));
-    int64_t* ask = (int64_t*)malloc(n * sizeof(int64_t));
-    int64_t* pnl = (int64_t*)malloc(n * sizeof(int64_t));
-    if (!bid || !ask || !pnl) return 1;
-    for (int64_t i = 0; i < n; i++) bid[i] = 100000 + (i & 7);
-    for (int64_t i = 0; i < n; i++) ask[i] = 100005 + (i & 7);
-    for (int64_t i = 0; i < n; i++) {
-        pnl[i] = ((ask[i] - bid[i]) * 8) + (bid[i] * 2) - 17;
-    }
-    int64_t check = pnl[n / 2];
-    free(bid); free(ask); free(pnl);
+    bench_bufs x;
+    x.a = (int64_t*)malloc(n * sizeof(int64_t));
+    x.b = (int64_t*)malloc(n * sizeof(int64_t));
+    x.out = (int64_t*)malloc(n * sizeof(int64_t));
+    if (!x.a || !x.b || !x.out) return 1;
+    bench_parallel(n, init10, &x);
+    bench_parallel(n, work10, &x);
+    int64_t check = x.out[n / 2];
+    free(x.a); free(x.b); free(x.out);
     return (int)check;
 }
 #endif
