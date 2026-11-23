@@ -26,6 +26,26 @@ view StrBuf {
 // initial capacity for a builder created without an explicit size
 let STRBUF_MIN_CAPACITY: int = 32
 
+// in-place growth via the process heap. alloc-new+copy+free touches every page
+// of every generation, which balloons peak working set on big builders, so grow
+// with HeapReAlloc and keep the copy path only as a fallback.
+using HeapReAllocFn = fn(ptr, int, ptr, int) -> ptr
+using GetProcessHeapFn = fn() -> ptr
+
+resolved function ptr strbuf_heap_realloc() {
+    let k = load_library("kernel32.dll")
+    if k == 0 { return 0 }
+    return get_proc(k, "HeapReAlloc")
+}
+
+resolved function ptr strbuf_process_heap() {
+    let k = load_library("kernel32.dll")
+    if k == 0 { return 0 }
+    let g = get_proc(k, "GetProcessHeap") as GetProcessHeapFn
+    if g == 0 { return 0 }
+    return g()
+}
+
 function StrBuf strbuf_alloc_handle() {
     var handle = malloc(24) as StrBuf
     if handle != 0 {
@@ -119,7 +139,17 @@ function bool strbuf_reserve(StrBuf buf, int needed) {
             want = previous + 1
         }
     }
-    let block = mem.make_zero(want)
+    let ra = strbuf_heap_realloc() as HeapReAllocFn
+    let heap = strbuf_process_heap()
+    if ra != 0 && heap != 0 {
+        let grown = ra(heap, 0, buf.data, want)
+        if grown != 0 {
+            buf.data = grown
+            buf.cap = want
+            return true
+        }
+    }
+    let block = mem.make(want)
     if block == 0 {
         return false
     }
@@ -200,7 +230,33 @@ function bool strbuf_append_int(StrBuf buf, i64 value) {
     if buf == 0 {
         return false
     }
-    return strbuf_append(buf, int_to_string(value))
+    // format straight into the buffer: no heap temp, nothing to leak
+    if !strbuf_reserve(buf, buf.len + 24) {
+        return false
+    }
+    var mag = value as u64
+    var neg = false
+    if value < 0 {
+        neg = true
+        mag = (0 - value) as u64
+    }
+    var pos = buf.len + 23
+    var digits = 0
+    loop {
+        mem.write8(buf.data + pos, 48 + ((mag % 10) as int))
+        mag = mag / 10
+        pos = pos - 1
+        digits = digits + 1
+        if mag == 0 { break }
+    }
+    if neg {
+        mem.write8(buf.data + pos, 45)
+        pos = pos - 1
+        digits = digits + 1
+    }
+    mem.move(buf.data + buf.len, buf.data + pos + 1, digits)
+    buf.len = buf.len + digits
+    return true
 }
 
 // append `count` copies of a single byte.

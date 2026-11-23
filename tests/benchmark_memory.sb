@@ -8,8 +8,7 @@ function int main() {
         strbuf_append_int(b, i);
         strbuf_append(b, "|ok\n");
     }
-    let big = strbuf_to_string(b);
-    strbuf_free(b);
+    let big = strbuf_terminate_view(b);
     let len = string_length(big);
 
     var sum = 0;
@@ -20,6 +19,6 @@ function int main() {
         sum = sum + slice[0];
         free(slice);
     }
-    free(big);
+    strbuf_free(b);
     return (len + sum) & 255;
 }
