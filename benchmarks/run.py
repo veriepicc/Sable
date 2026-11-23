@@ -101,6 +101,13 @@ BENCHMARKS = [
         "sable_file": ROOT_DIR / "tests" / "benchmark_hft_vec.sb",
         "c_macro": 10,
     },
+    {
+        "id": "memory",
+        "name": "Stdlib Memory Churn (300k appends + 200k slices)",
+        "desc": "Growable string build plus short-lived slice alloc/free churn; peak RAM and footprint",
+        "sable_file": ROOT_DIR / "tests" / "benchmark_memory.sb",
+        "c_macro": 11,
+    },
 ]
 
 def ensure_tcc(work_dir):
@@ -195,11 +202,53 @@ def find_sable_bin():
             return c
     return None
 
-def run_proc(cmd, cwd=None, env=None):
+def run_proc(cmd, cwd=None, env=None, mem=False):
+    if mem:
+        return run_proc_mem(cmd)
     if env is None:
         env = os.environ.copy()
     env["WINEDEBUG"] = "-all"
     return subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=env, timeout=120)
+
+def run_proc_mem(cmd):
+    # like run_proc but also captures the child's peak resident memory:
+    # win32 peak working set via GetProcessMemoryInfo, linux VmHWM polling
+    env = os.environ.copy()
+    env["WINEDEBUG"] = "-all"
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, env=env)
+    peak = 0
+    if sys.platform.startswith("win"):
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(0x0400 | 0x0010, False, p.pid)
+        out, err = p.communicate(timeout=120)
+        if h:
+            class PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t), ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t), ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t), ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t), ("PeakPagefileUsage", ctypes.c_size_t),
+                ]
+            pmc = PMC()
+            pmc.cb = ctypes.sizeof(PMC)
+            if k32.GetProcessMemoryInfo(h, ctypes.byref(pmc), pmc.cb):
+                peak = int(pmc.PeakWorkingSetSize)
+            k32.CloseHandle(h)
+    else:
+        status = Path(f"/proc/{p.pid}/status")
+        while p.poll() is None:
+            try:
+                for line in status.read_text().splitlines():
+                    if line.startswith("VmHWM:"):
+                        peak = max(peak, int(line.split()[1]) * 1024)
+            except OSError:
+                pass
+            time.sleep(0.002)
+        out, err = p.communicate(timeout=120)
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err), peak
 
 def execute_binary(exe_path, runs=4, warmup=1):
     is_windows = sys.platform.startswith("win")
@@ -212,13 +261,16 @@ def execute_binary(exe_path, runs=4, warmup=1):
         exits.append(proc.returncode)
 
     times = []
+    peaks = []
     exit_code = 0
     for _ in range(runs):
         t0 = time.perf_counter()
-        p = run_proc(cmd)
+        res = run_proc(cmd, mem=True)
+        p, peak = res if isinstance(res, tuple) else (res, 0)
         check_execution(p)
         t1 = time.perf_counter()
         times.append((t1 - t0) * 1000)
+        peaks.append(peak)
         exit_code = p.returncode
         exits.append(exit_code)
 
@@ -231,6 +283,7 @@ def execute_binary(exe_path, runs=4, warmup=1):
         "med_ms": times[len(times) // 2],
         "avg_ms": sum(times) / len(times),
         "exit_code": exit_code,
+        "peak_memory_bytes": max(peaks) if peaks else 0,
     }
 
 
@@ -348,6 +401,7 @@ def main():
                 "runtime_avg_ms": metrics["avg_ms"],
                 "runtime_med_ms": metrics["med_ms"],
                 "exit_code": metrics["exit_code"],
+                "peak_memory_bytes": metrics.get("peak_memory_bytes", 0),
             }
 
         # Windows process exit codes are 32-bit, but on Linux/Wine, POSIX exit status is 8-bit (code & 0xFF).
@@ -538,6 +592,35 @@ def generate_markdown(data, msvc_arch_flag=None, gcc_avx512=False):
 
         lines.append(
             f"| **{meta['name']}** | {sable_c} | {msvc_c} | {gcc_c} | {tcc_c} |"
+        )
+
+    lines += [
+        "",
+        "## Peak Memory (lower is better)",
+        "",
+        "| Workload | Sable | MSVC | GCC | TCC | Winner |",
+        "| :--- | ---: | ---: | ---: | ---: | :---: |",
+    ]
+
+    for bench_id, b_data in data.items():
+        meta = b_data["meta"]
+        res = b_data["results"]
+        if not res:
+            continue
+        mems = {n: r.get("peak_memory_bytes", 0) for n, r in res.items()}
+        known = {n: v for n, v in mems.items() if v > 0}
+        fastest_m = min(known.values(), default=0)
+        winner_m = next((n for n, v in known.items() if v == fastest_m), "—")
+
+        def fmt_m(n):
+            v = mems.get(n, 0)
+            if not v:
+                return "—"
+            s = f"{v / 1048576:.2f} MiB"
+            return f"**{s}**" if v == fastest_m else s
+
+        lines.append(
+            f"| **{meta['name']}** | {fmt_m('Sable')} | {fmt_m('MSVC')} | {fmt_m('GCC')} | {fmt_m('TCC')} | **{winner_m}** |"
         )
 
     lines += [

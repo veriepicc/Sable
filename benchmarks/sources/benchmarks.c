@@ -1,5 +1,6 @@
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #ifndef BENCH
 #define BENCH 1
@@ -12,7 +13,7 @@
 // are disjoint so every toolchain lands on the same checksum.
 // ============================================================================
 
-#if BENCH >= 6
+#if BENCH >= 6 && BENCH <= 10
 
 #ifdef _WIN32
 #include <windows.h>
@@ -413,6 +414,47 @@ int main(void) {
     bench_parallel(n, work10, &x);
     int64_t check = x.out[n / 2];
     free(x.a); free(x.b); free(x.out);
+    return (int)check;
+}
+
+#elif BENCH == 11
+// Stdlib Memory Churn (300k appends + 200k slice alloc/free)
+static char* m_buf;
+static int64_t m_len, m_cap;
+static void m_need(int64_t extra) {
+    if (m_len + extra <= m_cap) return;
+    while (m_cap < m_len + extra) m_cap *= 2;
+    m_buf = (char*)realloc(m_buf, (size_t)m_cap);
+}
+static void m_put(const char* s, int64_t n) {
+    m_need(n);
+    memcpy(m_buf + m_len, s, (size_t)n);
+    m_len += n;
+}
+static void m_dec(int64_t v) {
+    char tmp[24];
+    int k = 0;
+    if (v == 0) tmp[k++] = '0';
+    while (v > 0) { tmp[k++] = (char)('0' + (v % 10)); v /= 10; }
+    m_need(k);
+    for (int j = 0; j < k; j++) m_buf[m_len + j] = tmp[k - 1 - j];
+    m_len += k;
+}
+int main(void) {
+    m_cap = 64; m_len = 0;
+    m_buf = (char*)malloc((size_t)m_cap);
+    if (!m_buf) return 1;
+    for (int64_t i = 0; i < 300000; i++) { m_put("ord|", 4); m_dec(i); m_put("|ok\n", 4); }
+    int64_t sum = 0;
+    for (int64_t k = 0; k < 200000; k++) {
+        int64_t start = (k * 7) % (m_len - 16);
+        char* s = (char*)malloc(16);
+        memcpy(s, m_buf + start, 16);
+        sum += (unsigned char)s[0];
+        free(s);
+    }
+    int64_t check = (m_len + sum) & 255;
+    free(m_buf);
     return (int)check;
 }
 #endif

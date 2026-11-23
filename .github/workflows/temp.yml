@@ -1,0 +1,73 @@
+name: Temp CI
+
+on:
+  push:
+    branches: [temp]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build compiler / Windows Server 2022 / x64
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - name: Build Release x64
+        run: ./tools/ci-build.ps1
+      - name: Upload compiler
+        uses: actions/upload-artifact@v4
+        with:
+          name: sable-windows-x64-temp
+          path: bin/Release/sable.exe
+          if-no-files-found: error
+
+  windows-tests:
+    name: Tests / Windows Server 2022 / x64
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: sable-windows-x64-temp
+          path: bin/Release/
+      - name: Run tests
+        run: python tests/test_runner.py -v
+      - name: Run compiler tests
+        run: python tests/run.py --verbose --report test-results.json
+
+  benchmarks:
+    name: Showdown + peak memory / Windows Server 2022 / x64
+    needs: build
+    runs-on: windows-2022
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: microsoft/setup-msbuild@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - uses: actions/download-artifact@v4
+        with:
+          name: sable-windows-x64-temp
+          path: bin/Release/
+      - name: Run showdown natively (real runtime + peak RAM, no wine overhead)
+        run: python benchmarks/run.py --iterations 5 --warmup 2 --skip-update-md
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: temp-benchmark-results
+          path: |
+            benchmark-results.json
+            benchmark-summary.md
+          if-no-files-found: error
