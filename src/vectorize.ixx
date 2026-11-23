@@ -399,7 +399,7 @@ inline std::optional<Plan> plan(const Loop& raw_loop, unsigned registers, std::s
 
 inline void memory32(E& e, bool store, R reg, R base, std::int32_t offset = 0) {
     auto& b = e.buffer();
-    b.emit8(e.rex(false, reg, base)); b.emit8(store ? 0x89 : 0x8b);
+    { auto r = e.rex(false, reg, base); if (r != 0x40) b.emit8(r); } b.emit8(store ? 0x89 : 0x8b);
     e.emit_mem_operand(reg, base, offset);
 }
 

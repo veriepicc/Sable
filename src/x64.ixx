@@ -41,7 +41,8 @@ enum class Reg : std::uint8_t {
     R8  = 8, R9  = 9, R10 = 10, R11 = 11,
     R12 = 12, R13 = 13, R14 = 14, R15 = 15,
     
-    // 32-bit versions (same encoding, different REX)
+    // encoding-only aliases: same reg bits as the 64-bit names. operand size
+    // comes from the op (rex.w present or not), never from picking EAX over RAX
     EAX = 0, ECX = 1, EDX = 2, EBX = 3,
     ESP = 4, EBP = 5, ESI = 6, EDI = 7,
 };
@@ -198,12 +199,20 @@ public:
         return (mod << 6) | ((static_cast<std::uint8_t>(reg) & 7) << 3) | (static_cast<std::uint8_t>(rm) & 7);
     }
 
+    // a null rex (0x40) carries no bits so dropping it is free size. safe here
+    // because every rex(false) site uses non-byte operands
+    void emit_rex(std::uint8_t r) {
+        if (r != 0x40) buf_.emit8(r);
+    }
+
     // power of two detection helpers
     [[nodiscard]] static constexpr bool is_power_of_two(std::int64_t n) {
-        return n > 1 && (n & (n - 1)) == 0;
+        return n > 0 && (n & (n - 1)) == 0;
     }
 
     [[nodiscard]] static inline int log2_pow2(std::uint64_t n) {
+        // ctzll(0) is undefined, pin the empty case so callers cant trip ub
+        if (n == 0) return 0;
         // count trailing zeros = log2 for power of two
         #ifdef _MSC_VER
             unsigned long index;
@@ -215,12 +224,16 @@ public:
     }
 
 
+    // full 10-byte mov r64, imm64. mov_smart picks the shorter forms when it can
     void mov_imm64(Reg dst, std::uint64_t imm) {
         buf_.emit8(rex(true, Reg::RAX, dst));
         buf_.emit8(0xB8 + (static_cast<std::uint8_t>(dst) & 7));
         buf_.emit64(imm);
     }
 
+    // mov r/m64, imm32 sign-extended (C7 /0 + REX.W), NOT a 32-bit operand:
+    // the immediate is signed so 0x80000000 lands as 0xffffffff80000000.
+    // callers must pass values that fit signed32, use mov_imm64 for the rest
     void mov_imm32(Reg dst, std::int32_t imm) {
         buf_.emit8(rex(true, Reg::RAX, dst));
         buf_.emit8(0xC7);
@@ -554,6 +567,11 @@ public:
 
     // smart multiply - uses shift for power of 2, lea for 3/5/9, imm8 for small values
     void imul_smart(Reg dst, Reg src, std::int64_t imm) {
+        // mul by 1 is a copy, dont burn a shl 0 on it
+        if (imm == 1) {
+            if (dst != src) mov(dst, src);
+            return;
+        }
         // power of two → shift
         if (is_power_of_two(imm)) {
             if (dst != src) mov(dst, src);
@@ -604,6 +622,8 @@ public:
         (void)dst;
         assert(dst == Reg::RAX && "idiv result must be in RAX");
         assert(divisor != 0 && "division by zero");
+        // div by 1 is identity, result already sits in rax
+        if (divisor == 1) return;
         
         // power of two → shift
         if (!is_signed && divisor > 0 && is_power_of_two(divisor)) {
@@ -1015,7 +1035,7 @@ public:
 
     // 32-bit xor zero-extends to 64, good for zeroing regs
     void xor_32(Reg dst, Reg src) {
-        buf_.emit8(rex(false, src, dst));
+        emit_rex(rex(false, src, dst));
         buf_.emit8(0x31);
         buf_.emit8(modrm(0b11, src, dst));
     }
@@ -1091,7 +1111,7 @@ public:
     // paddq xmm, xmm - packed add quadword (64-bit x2)
     void paddq(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0xD4);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1108,7 +1128,7 @@ public:
     // psubq xmm, xmm - packed subtract quadword (64-bit x2)
     void psubq(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0xFB);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1125,7 +1145,7 @@ public:
     // vmovdqu128 xmm, [mem] - load 128 bits (2x i64) into XMM (SSE2)
     void movdqu128_load(XmmReg dst, Reg base, std::int32_t offset = 0) {
         buf_.emit8(0xF3);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), base));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), base));
         buf_.emit8(0x0F);
         buf_.emit8(0x6F);
         emit_mem_operand(Reg(static_cast<std::uint8_t>(dst)), base, offset);
@@ -1134,7 +1154,7 @@ public:
     // movntdq [base+offset], xmm - non-temporal streaming store (128-bit, 16-byte aligned)
     void movntdq_store(Reg base, std::int32_t offset, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(src)), base));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(src)), base));
         buf_.emit8(0x0F);
         buf_.emit8(0xE7);
         emit_mem_operand(Reg(static_cast<std::uint8_t>(src)), base, offset);
@@ -1143,7 +1163,7 @@ public:
     // vmovdqu128 [mem], xmm - store 128 bits (2x i64) from XMM (SSE2)
     void movdqu128_store(Reg base, std::int32_t offset, XmmReg src) {
         buf_.emit8(0xF3);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(src)), base));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(src)), base));
         buf_.emit8(0x0F);
         buf_.emit8(0x7F);
         emit_mem_operand(Reg(static_cast<std::uint8_t>(src)), base, offset);
@@ -1152,7 +1172,7 @@ public:
     // vmovq xmm, r64 - move 64 bits from GP to XMM
     void vmovq_from_gpr(XmmReg dst, Reg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), src));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), src));
         buf_.emit8(0x0F);
         buf_.emit8(0x6E);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), src));
@@ -1161,7 +1181,7 @@ public:
     // vmovq r64, xmm - move 64 bits from XMM to GP
     void vmovq_to_gpr(Reg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(src)), dst));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(src)), dst));
         buf_.emit8(0x0F);
         buf_.emit8(0x7E);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(src)), dst));
@@ -1170,7 +1190,7 @@ public:
     // paddd xmm, xmm - packed add dword (32-bit x4)
     void paddd(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0xFE);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1179,7 +1199,7 @@ public:
     // psubd xmm, xmm - packed subtract dword (32-bit x4)
     void psubd(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0xFA);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1188,7 +1208,7 @@ public:
     // pmulld xmm, xmm - packed multiply low dword (32-bit x4, result is low 32 bits)
     void pmulld(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0x38);
         buf_.emit8(0x40);
@@ -1207,7 +1227,7 @@ public:
     // punpcklqdq xmm, xmm - unpack low quadwords (interleave low halves)
     void punpcklqdq(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0x6C);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1216,7 +1236,7 @@ public:
     // pshufd xmm, xmm, imm8 - packed shuffle dword lanes
     void pshufd(XmmReg dst, XmmReg src, std::uint8_t imm) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(src)), Reg(static_cast<std::uint8_t>(dst))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(src)), Reg(static_cast<std::uint8_t>(dst))));
         buf_.emit8(0x0F);
         buf_.emit8(0x70);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1226,7 +1246,7 @@ public:
     // pmuludq xmm, xmm - multiply low dword of each qword lane into qword (SSE2)
     void pmuludq(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0xF4);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1235,7 +1255,7 @@ public:
     // psrlq xmm, imm8 - shift qword lanes right logical
     void psrlq(XmmReg dst, std::uint8_t imm) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(2), Reg(static_cast<std::uint8_t>(dst))));
+        emit_rex(rex(false, Reg(2), Reg(static_cast<std::uint8_t>(dst))));
         buf_.emit8(0x0F);
         buf_.emit8(0x73);
         buf_.emit8(modrm(0b11, Reg(2), Reg(static_cast<std::uint8_t>(dst))));
@@ -1245,7 +1265,7 @@ public:
     // pslld xmm, imm8 - shift dword lanes left
     void pslld(XmmReg dst, std::uint8_t imm) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(6), Reg(static_cast<std::uint8_t>(dst))));
+        emit_rex(rex(false, Reg(6), Reg(static_cast<std::uint8_t>(dst))));
         buf_.emit8(0x0F);
         buf_.emit8(0x72);
         buf_.emit8(modrm(0b11, Reg(6), Reg(static_cast<std::uint8_t>(dst))));
@@ -1255,7 +1275,7 @@ public:
     // psllq xmm, imm8 - shift qword lanes left
     void psllq(XmmReg dst, std::uint8_t imm) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(6), Reg(static_cast<std::uint8_t>(dst))));
+        emit_rex(rex(false, Reg(6), Reg(static_cast<std::uint8_t>(dst))));
         buf_.emit8(0x0F);
         buf_.emit8(0x73);
         buf_.emit8(modrm(0b11, Reg(6), Reg(static_cast<std::uint8_t>(dst))));
@@ -1309,7 +1329,7 @@ public:
     // por xmm, xmm - bitwise OR
     void por(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0xEB);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1318,7 +1338,7 @@ public:
     // pxor xmm, xmm - bitwise XOR (also used to zero XMM reg)
     void pxor(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0xEF);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1327,7 +1347,7 @@ public:
     // pand xmm, xmm - bitwise AND
     void pand(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0xDB);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1344,7 +1364,7 @@ public:
     // movdqa xmm, xmm - move aligned double quadword (register to register)
     void movdqa(XmmReg dst, XmmReg src) {
         buf_.emit8(0x66);
-        buf_.emit8(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
+        emit_rex(rex(false, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
         buf_.emit8(0x0F);
         buf_.emit8(0x6F);
         buf_.emit8(modrm(0b11, Reg(static_cast<std::uint8_t>(dst)), Reg(static_cast<std::uint8_t>(src))));
@@ -1584,7 +1604,7 @@ public:
 
     // prefetcht0 [base+offset] - pulls cache line into L1 cache
     void prefetch_t0(Reg base, std::int32_t offset) {
-        buf_.emit8(rex(false, Reg::RAX, base));
+        emit_rex(rex(false, Reg::RAX, base));
         buf_.emit8(0x0F);
         buf_.emit8(0x18);
         emit_mem_operand(Reg(1), base, offset); // /1 is prefetcht0
@@ -2606,14 +2626,21 @@ buf_.emit8(0x6F);
 
     // memory operand with scaled index for gather/scatter
     void emit_mem_operand_scaled_index(Reg reg_field, Reg base, Reg index, std::uint8_t scale) {
-        buf_.emit8(modrm(0b00, reg_field, Reg(4)));  // modrm points to SIB
+        assert((scale == 1 || scale == 2 || scale == 4 || scale == 8) &&
+               "gather/scatter scale must be 1, 2, 4, or 8");
+        assert((static_cast<std::uint8_t>(index) & 7) != 4 &&
+               "scaled index: RSP/R12 cannot be used as index");
         std::uint8_t scale_bits = 0;
         if (scale == 2) scale_bits = 1;
         else if (scale == 4) scale_bits = 2;
         else if (scale == 8) scale_bits = 3;
+        // mod=00 with sib base 101 means disp32 and no base, so rbp/r13 needs disp8=0
+        bool rbp_base = (static_cast<std::uint8_t>(base) & 7) == 5;
+        buf_.emit8(modrm(rbp_base ? 0b01 : 0b00, reg_field, Reg(4)));  // modrm points to SIB
         buf_.emit8((scale_bits << 6) |
                    ((static_cast<std::uint8_t>(index) & 7) << 3) |
                    (static_cast<std::uint8_t>(base) & 7));
+        if (rbp_base) buf_.emit8(0x00);
     }
 
 private:
