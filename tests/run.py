@@ -171,16 +171,25 @@ def execute(case, compiler, workspace, timeout):
             if case['Healing'] != 'auto' or kind != 'stress':
                 raise AssertionError('healing is only supported for explicit auto-recovery stress cases')
             isolated = workspace / '.recovery' / source.relative_to(workspace).with_suffix('')
+            if case.get('SourcePaddingBytes'):
+                isolated = isolated.with_name(f'{isolated.name}-padded')
             isolated.mkdir(parents=True, exist_ok=True)
             copied = isolated / source.name
             shutil.copy2(source, copied)
+            if padding := case.get('SourcePaddingBytes'):
+                with copied.open('ab') as output:
+                    output.write(b'\n//' + b'x' * padding + b'\n')
             source = copied
             (isolated / 'sable.project').write_text(
                 'project Recovery {\n'
                 f'    entry: "{source.name}"\n'
                 '    mode: "exe"\n    debug: true\n    healing: "auto"\n}\n')
         args = ['build', source] if 'project' in kind else ['--run', source] if kind == 'run' else [source]
-        proc = invoke(command(compiler, *args), workspace, timeout)
+        build_cwd = workspace
+        if case.get('BareProjectPath'):
+            args = ['build', source.name]
+            build_cwd = source.parent
+        proc = invoke(command(compiler, *args), build_cwd, timeout)
         check_crash(proc)
         if kind.startswith('reject'):
             check_rejection(proc, case.get('ExpectedErrorContains'))
