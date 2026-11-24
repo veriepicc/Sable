@@ -7600,7 +7600,8 @@ function bool strbuf_append(StrBuf buf, str text_value) {
     if n <= 0 {
         return true
     }
-    if !strbuf_reserve(buf, buf.len + n) {
+    let needed = buf.len + n
+    if needed > buf.cap && !strbuf_reserve(buf, needed) {
         return false
     }
     memcpy(buf.data + buf.len, text_value as ptr, n)
@@ -7643,7 +7644,8 @@ function bool strbuf_append_int(StrBuf buf, i64 value) {
         return false
     }
     // format straight into the buffer: no heap temp, nothing to leak
-    if !strbuf_reserve(buf, buf.len + 24) {
+    let needed = buf.len + 24
+    if needed > buf.cap && !strbuf_reserve(buf, needed) {
         return false
     }
     var mag = value as u64
@@ -7655,8 +7657,9 @@ function bool strbuf_append_int(StrBuf buf, i64 value) {
     var pos = buf.len + 23
     var digits = 0
     loop {
-        mem.write8(buf.data + pos, 48 + ((mag % 10) as int))
-        mag = mag / 10
+        let quotient = mag / 10
+        mem.write8(buf.data + pos, 48 + ((mag - quotient * 10) as int))
+        mag = quotient
         pos = pos - 1
         digits = digits + 1
         if mag == 0 { break }
@@ -7720,10 +7723,10 @@ function str strbuf_to_string(StrBuf buf) {
     return string_substring(strbuf_view(buf), 0, buf.len)
 }
 
-// materialize the contents as a fresh heap string and reset the builder to empty.
+// materialize the contents as a fresh hea)SBSTRBUF"
+            R"SBSTRBUF(p string and reset the builder to empty.
 function str strbuf_take_string(StrBuf buf) {
-    if buf == 0 || buf.data == 0 || buf.len )SBSTRBUF"
-            R"SBSTRBUF(<= 0 {
+    if buf == 0 || buf.data == 0 || buf.len <= 0 {
         return make_string("")
     }
     let result = string_substring(strbuf_view(buf), 0, buf.len)

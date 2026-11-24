@@ -62,8 +62,14 @@ function int test_int_and_repeat() {
     strbuf_append_int(b, 42)
     strbuf_append(b, ",")
     strbuf_append_int(b, 0 - 7)
+    strbuf_append(b, ",")
+    strbuf_append_int(b, 0)
+    strbuf_append(b, ",")
+    strbuf_append_int(b, 9223372036854775807)
+    strbuf_append(b, ",")
+    strbuf_append_int(b, 0 - 9223372036854775807 - 1)
     let s = strbuf_to_string(b)
-    if !str_eq(s, "42,-7") {
+    if !str_eq(s, "42,-7,0,9223372036854775807,-9223372036854775808") {
         print("FAIL int append: ")
         println(s)
         free(s)

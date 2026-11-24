@@ -420,6 +420,8 @@ int main(void) {
 #elif BENCH == 11
 // Stdlib Memory Churn (300k appends + 200k slice alloc/free)
 static char* m_buf;
+// keep the allocated slice observable so the optimizer cannot erase the churn
+static char* volatile m_live_slice;
 static int64_t m_len, m_cap;
 static void m_need(int64_t extra) {
     if (m_len + extra <= m_cap) return;
@@ -450,7 +452,9 @@ int main(void) {
         int64_t start = (k * 7) % (m_len - 16);
         char* s = (char*)malloc(16);
         memcpy(s, m_buf + start, 16);
-        sum += (unsigned char)s[0];
+        m_live_slice = s;
+        sum += (unsigned char)m_live_slice[0];
+        m_live_slice = NULL;
         free(s);
     }
     int64_t check = (m_len + sum) & 255;
