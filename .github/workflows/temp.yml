@@ -63,6 +63,20 @@ jobs:
           path: bin/Release/
       - name: Run showdown natively (real runtime + peak RAM, no wine overhead)
         run: python benchmarks/run.py --iterations 5 --warmup 2 --skip-update-md
+      - name: Profile Sable memory churn phases
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:RUNNER_TEMP 'profile_memory.sb'
+          $exe = [IO.Path]::ChangeExtension($source, '.exe')
+          Copy-Item benchmarks/sources/profile_memory.sb $source
+          & ./bin/Release/sable.exe --fast $source
+          if ($LASTEXITCODE -ne 0 -or !(Test-Path $exe)) { throw 'profile build failed' }
+          for ($i = 0; $i -lt 5; $i++) {
+            $sample = & $exe
+            if ($LASTEXITCODE -ne 176) { throw "profile checksum: $LASTEXITCODE, expected 176" }
+            if (@($sample -match 'us: [1-9][0-9]*\s*$').Count -ne 4) { throw "invalid profile sample: $sample" }
+            "sample $($i + 1): checksum 176", $sample | Tee-Object -FilePath memory-profile.txt -Append
+          }
       - name: Upload results
         uses: actions/upload-artifact@v4
         with:
@@ -70,4 +84,5 @@ jobs:
           path: |
             benchmark-results.json
             benchmark-summary.md
+            memory-profile.txt
           if-no-files-found: error

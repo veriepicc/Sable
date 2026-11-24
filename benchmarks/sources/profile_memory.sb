@@ -1,0 +1,74 @@
+import strbuf
+
+using ClockFn = fn(ptr) -> int
+
+fn ticks(clock: ClockFn) -> int {
+    var stamp = 0
+    if clock((&stamp) as ptr) == 0 { return 0 }
+    return stamp
+}
+
+fn profile_fill_records(b: StrBuf) -> bool {
+    for i in range(0, 300000) {
+        if !strbuf_append(b, "ord|") { return false }
+        if !strbuf_append_int(b, i) { return false }
+        if !strbuf_append(b, "|ok\n") { return false }
+    }
+    return true
+}
+
+fn report(label: str, elapsed: int, frequency: int) -> void {
+    print(label)
+    print_int(elapsed * 1000000 / frequency)
+}
+
+fn main() -> int {
+    let kernel = load_library("kernel32.dll")
+    if kernel == 0 { return 1 }
+    let counter = get_proc(kernel, "QueryPerformanceCounter") as ClockFn
+    let sample_rate = get_proc(kernel, "QueryPerformanceFrequency") as ClockFn
+    if counter == 0 || sample_rate == 0 { return 2 }
+    let hz = ticks(sample_rate)
+    if hz <= 0 { return 3 }
+
+    let b = strbuf_new()
+    if b == 0 { return 4 }
+    let grow_start = ticks(counter)
+    if !profile_fill_records(b) { return 5 }
+    let grow_elapsed = ticks(counter) - grow_start
+    let big = strbuf_terminate_view(b)
+    let len = string_length(big)
+    if len != 4088890 { return 6 }
+
+    var sum = 0
+    let slice_start = ticks(counter)
+    for k in range(0, 200000) {
+        let start = (k * 7) % (len - 16)
+        let slice = string_substring(big, start, 16)
+        sum = sum + slice[0]
+        free(slice)
+    }
+    let slice_elapsed = ticks(counter) - slice_start
+    strbuf_free(b)
+
+    let sized = strbuf_with_capacity(len + 24)
+    if sized == 0 { return 7 }
+    let sized_start = ticks(counter)
+    if !profile_fill_records(sized) { return 8 }
+    let sized_elapsed = ticks(counter) - sized_start
+    if strbuf_len(sized) != len { return 9 }
+    strbuf_clear(sized)
+    let decimal_start = ticks(counter)
+    for i in range(0, 300000) {
+        if !strbuf_append_int(sized, i) { return 10 }
+    }
+    let decimal_elapsed = ticks(counter) - decimal_start
+    if strbuf_len(sized) != 1688890 { return 11 }
+    strbuf_free(sized)
+
+    report("build growing us: ", grow_elapsed, hz)
+    report("build pre-sized us: ", sized_elapsed, hz)
+    report("decimal append us: ", decimal_elapsed, hz)
+    report("slice alloc/copy/free us: ", slice_elapsed, hz)
+    return (len + sum) & 255
+}
